@@ -1,0 +1,51 @@
+{
+  "api_key": "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ",
+  "otps": {},
+  "merchants": {
+    "9876543210": {
+      "pin": "5678",
+      "shop_id": "shop_mt8ct3gynbrk",
+      "shop_name": "Rahul Fashion House",
+      "category": "Clothing",
+      "location": "Gariahat, Kolkata",
+      "created_at": 1787643540178
+    }
+  },
+  "orders": [
+    {
+      "order_id": "NX99901",
+      "shop_name": "Rahul Fashion House",
+      "shop_id": "shop_mt8ct3gynbrk",
+      "total": 1598,
+      "source": "nexora_customer_app",
+      "placed_at": 1787643540710,
+      "customer_name": "Samim Ali",
+      "customer_phone": "9123456789",
+      "address_line1": "12 Park Street",
+      "address_line2": "Near Metro",
+      "landmark": "",
+      "city": "Kolkata",
+      "pincode": "700016",
+      "full_address": "12 Park Street, Near Metro, Kolkata - 700016",
+      "items": [
+        {
+          "name": "Cotton Shirt",
+          "qty": 2,
+          "line_total": 1598
+        }
+      ],
+      "status": 0
+    }
+  ],
+  "products": [
+    {
+      "id": "p1",
+      "shop_id": "",
+      "name": "Cotton Casual Shirt",
+      "price": 799,
+      "description": "Pure cotton",
+      "image_uri": "",
+      "updated_at": 1787643541218
+    }
+  ]
+}
