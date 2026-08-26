@@ -244,6 +244,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, order_id: orderId, status });
     }
 
+    // ----- Shops (derived from registered merchants) -----
+    if (req.method === "GET" && p === "/shops") {
+      const shops = Object.keys(db.merchants).map((phone) => {
+        const m = db.merchants[phone];
+        return {
+          id: m.shop_id,
+          name: m.shop_name,
+          category: m.category || "General",
+          location: m.location || "",
+          rating: 4.0,
+        };
+      });
+      return json(res, 200, { ok: true, shops });
+    }
+
     // ----- Products -----
     if (req.method === "GET" && p === "/products") {
       let list = db.products.slice();
