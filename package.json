@@ -1,9 +1,12 @@
 {
   "name": "nexora-server",
-  "version": "1.0.0",
-  "description": "Nexora OTP, orders, merchant API",
+  "version": "1.1.0",
+  "description": "Nexora persistent API — OTP, merchant, products, orders",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
   }
 }
