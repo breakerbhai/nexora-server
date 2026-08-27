@@ -1,72 +1,51 @@
 /**
- * Nexora API Server — persistent JSON database
- * Data file: data/db.json (atomic write)
+ * Nexora API Server — MongoDB Atlas persistent storage
+ * Same routes/behavior as the old db.json version, but data survives restarts/deploys.
+ *
+ * ENV required:
+ *   MONGODB_URI = mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/nexora?retryWrites=true&w=majority
+ *   PORT        = (optional, Render sets this automatically)
  *
  * Run:  node server.js
  * Or:   npm start
  */
 
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
+const { MongoClient } = require("mongodb");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
-const DATA_DIR = path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "db.json");
-const DB_TMP = path.join(DATA_DIR, "db.json.tmp");
+const MONGODB_URI = process.env.MONGODB_URI || "";
 
-// Fixed key so apps Config.java keep working (change later if needed)
-const DEFAULT_API_KEY = "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ";
+// Fixed key so apps' Config.java keep working (change later if needed)
+const DEFAULT_API_KEY = process.env.API_KEY || "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ";
 
-function randomKey() {
-  return crypto.randomBytes(24).toString("base64url");
+if (!MONGODB_URI) {
+  console.error("[FATAL] MONGODB_URI env var is not set. Set it on Render → Environment.");
+  process.exit(1);
 }
 
-function emptyDb() {
-  return {
-    api_key: DEFAULT_API_KEY,
-    otps: {},
-    merchants: {},
-    orders: [],
-    products: [],
-    // shop_id -> { logo_uri, banner_uri, rating, rating_count }
-    shop_meta: {},
-  };
-}
+let client;
+let db; // mongo database handle
+let merchants, products, orders, otps, shopMeta;
 
-function ensureDb() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(emptyDb(), null, 2), "utf8");
-  }
-}
+async function connectDb() {
+  client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db(); // uses db name from URI (nexora)
+  merchants = db.collection("merchants"); // _id = phone
+  products = db.collection("products");   // _id = product id (string)
+  orders = db.collection("orders");       // _id = order_id (string)
+  otps = db.collection("otps");           // _id = phone
+  shopMeta = db.collection("shop_meta");  // _id = shop_id
 
-function loadDb() {
-  ensureDb();
-  try {
-    const raw = fs.readFileSync(DB_FILE, "utf8");
-    const db = JSON.parse(raw);
-    if (!db.api_key) db.api_key = DEFAULT_API_KEY;
-    if (!db.otps) db.otps = {};
-    if (!db.merchants) db.merchants = {};
-    if (!Array.isArray(db.orders)) db.orders = [];
-    if (!Array.isArray(db.products)) db.products = [];
-    if (!db.shop_meta) db.shop_meta = {};
-    return db;
-  } catch (e) {
-    console.error("[DB] load failed, using empty:", e.message);
-    return emptyDb();
-  }
-}
+  // Helpful indexes (safe to call every boot — no-ops if they already exist)
+  await products.createIndex({ shop_id: 1 });
+  await orders.createIndex({ shop_id: 1 });
+  await orders.createIndex({ placed_at: -1 });
 
-/** Atomic write — avoids corrupt db.json on crash mid-write */
-function saveDb(db) {
-  ensureDb();
-  const json = JSON.stringify(db, null, 2);
-  fs.writeFileSync(DB_TMP, json, "utf8");
-  fs.renameSync(DB_TMP, DB_FILE);
+  console.log("[DB] Mongo connected →", db.databaseName);
 }
 
 function json(res, status, obj) {
@@ -107,9 +86,9 @@ function readBody(req) {
   });
 }
 
-function checkApiKey(req, db) {
+function checkApiKey(req) {
   const key = req.headers["x-api-key"] || "";
-  return key && key === db.api_key;
+  return key && key === DEFAULT_API_KEY;
 }
 
 function genOtp() {
@@ -120,11 +99,13 @@ function genId(prefix) {
   return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
-function getShopMeta(db, shopId) {
-  if (!db.shop_meta[shopId]) {
-    db.shop_meta[shopId] = { logo_uri: "", banner_uri: "", rating: 0, rating_count: 0 };
+async function getShopMeta(shopId) {
+  let meta = await shopMeta.findOne({ _id: shopId });
+  if (!meta) {
+    meta = { _id: shopId, logo_uri: "", banner_uri: "", rating: 0, rating_count: 0 };
+    await shopMeta.insertOne(meta);
   }
-  return db.shop_meta[shopId];
+  return meta;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -137,23 +118,27 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  const db = loadDb();
   const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
   const p = u.pathname.replace(/\/+$/, "") || "/";
 
   try {
     if (req.method === "GET" && (p === "/" || p === "/health")) {
+      const [mCount, oCount, prCount] = await Promise.all([
+        merchants.countDocuments(),
+        orders.countDocuments(),
+        products.countDocuments(),
+      ]);
       return json(res, 200, {
         ok: true,
         service: "nexora-server",
-        storage: "data/db.json",
-        merchants: Object.keys(db.merchants).length,
-        orders: db.orders.length,
-        products: db.products.length,
+        storage: "mongodb",
+        merchants: mCount,
+        orders: oCount,
+        products: prCount,
       });
     }
 
-    if (!checkApiKey(req, db)) {
+    if (!checkApiKey(req)) {
       return json(res, 401, { ok: false, error: "Invalid or missing X-API-Key" });
     }
 
@@ -163,8 +148,11 @@ const server = http.createServer(async (req, res) => {
       const phone = String(body.phone || "").trim();
       if (phone.length < 10) return json(res, 400, { ok: false, error: "Valid phone required" });
       const code = genOtp();
-      db.otps[phone] = { code, expires: Date.now() + 5 * 60 * 1000 };
-      saveDb(db);
+      await otps.updateOne(
+        { _id: phone },
+        { $set: { code, expires: Date.now() + 5 * 60 * 1000 } },
+        { upsert: true }
+      );
       console.log(`[OTP] ${phone} → ${code}`);
       return json(res, 200, { ok: true, message: "OTP sent", otp_dev: code });
     }
@@ -173,16 +161,14 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const phone = String(body.phone || "").trim();
       const otp = String(body.otp || "").trim();
-      const rec = db.otps[phone];
+      const rec = await otps.findOne({ _id: phone });
       if (!rec) return json(res, 400, { ok: false, error: "No OTP requested for this phone" });
       if (Date.now() > rec.expires) {
-        delete db.otps[phone];
-        saveDb(db);
+        await otps.deleteOne({ _id: phone });
         return json(res, 400, { ok: false, error: "OTP expired" });
       }
       if (rec.code !== otp) return json(res, 400, { ok: false, error: "Wrong OTP" });
-      delete db.otps[phone];
-      saveDb(db);
+      await otps.deleteOne({ _id: phone });
       return json(res, 200, { ok: true, message: "Verified" });
     }
 
@@ -197,20 +183,22 @@ const server = http.createServer(async (req, res) => {
       if (phone.length < 10) return json(res, 400, { ok: false, error: "Valid phone required" });
       if (pin.length < 4) return json(res, 400, { ok: false, error: "PIN at least 4 digits" });
       if (!shop_name) return json(res, 400, { ok: false, error: "Shop name required" });
-      if (db.merchants[phone]) {
+
+      const existing = await merchants.findOne({ _id: phone });
+      if (existing) {
         return json(res, 400, { ok: false, error: "This phone is already registered. Sign in instead." });
       }
       const shop_id = genId("shop_");
-      db.merchants[phone] = {
+      await merchants.insertOne({
+        _id: phone,
         pin,
         shop_id,
         shop_name,
         category,
         location,
         created_at: Date.now(),
-      };
-      getShopMeta(db, shop_id);
-      saveDb(db);
+      });
+      await getShopMeta(shop_id);
       console.log(`[MERCHANT] registered ${phone} → ${shop_name} (${shop_id})`);
       return json(res, 200, { ok: true, shop_id, shop_name, category, location });
     }
@@ -219,7 +207,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const phone = String(body.phone || "").trim();
       const pin = String(body.pin || "").trim();
-      const m = db.merchants[phone];
+      const m = await merchants.findOne({ _id: phone });
       if (!m || m.pin !== pin) {
         return json(res, 401, { ok: false, error: "Invalid phone or PIN" });
       }
@@ -238,40 +226,46 @@ const server = http.createServer(async (req, res) => {
       const shop_id = String(body.shop_id || "").trim();
       if (!shop_id) return json(res, 400, { ok: false, error: "shop_id required" });
 
-      let found = null;
-      for (const phone of Object.keys(db.merchants)) {
-        if (db.merchants[phone].shop_id === shop_id) {
-          found = db.merchants[phone];
-          break;
-        }
-      }
+      const found = await merchants.findOne({ shop_id });
       if (!found) return json(res, 404, { ok: false, error: "Shop not found" });
 
-      if (body.shop_name != null) found.shop_name = String(body.shop_name).trim();
-      if (body.category != null) found.category = String(body.category).trim();
-      if (body.location != null) found.location = String(body.location).trim();
+      const update = {};
+      if (body.shop_name != null) update.shop_name = String(body.shop_name).trim();
+      if (body.category != null) update.category = String(body.category).trim();
+      if (body.location != null) update.location = String(body.location).trim();
+      if (Object.keys(update).length) {
+        await merchants.updateOne({ shop_id }, { $set: update });
+      }
 
-      const meta = getShopMeta(db, shop_id);
-      if (body.logo_uri != null) meta.logo_uri = String(body.logo_uri);
-      if (body.banner_uri != null) meta.banner_uri = String(body.banner_uri);
+      const metaUpdate = {};
+      if (body.logo_uri != null) metaUpdate.logo_uri = String(body.logo_uri);
+      if (body.banner_uri != null) metaUpdate.banner_uri = String(body.banner_uri);
+      await getShopMeta(shop_id); // ensure exists
+      if (Object.keys(metaUpdate).length) {
+        await shopMeta.updateOne({ _id: shop_id }, { $set: metaUpdate });
+      }
 
-      saveDb(db);
+      const finalMerchant = await merchants.findOne({ shop_id });
+      const finalMeta = await shopMeta.findOne({ _id: shop_id });
+
       return json(res, 200, {
         ok: true,
         shop_id,
-        shop_name: found.shop_name,
-        category: found.category,
-        location: found.location,
-        logo_uri: meta.logo_uri || "",
-        banner_uri: meta.banner_uri || "",
+        shop_name: finalMerchant.shop_name,
+        category: finalMerchant.category,
+        location: finalMerchant.location,
+        logo_uri: finalMeta.logo_uri || "",
+        banner_uri: finalMeta.banner_uri || "",
       });
     }
 
     // ----- Orders -----
     if (req.method === "POST" && p === "/orders") {
       const body = await readBody(req);
+      const order_id = body.order_id || genId("NX");
       const order = {
-        order_id: body.order_id || genId("NX"),
+        _id: order_id,
+        order_id,
         shop_name: body.shop_name || "",
         shop_id: body.shop_id || "",
         total: Number(body.total) || 0,
@@ -289,27 +283,19 @@ const server = http.createServer(async (req, res) => {
         status: 0,
       };
       if (!order.shop_id && order.shop_name) {
-        for (const phone of Object.keys(db.merchants)) {
-          if (db.merchants[phone].shop_name === order.shop_name) {
-            order.shop_id = db.merchants[phone].shop_id;
-            break;
-          }
-        }
+        const m = await merchants.findOne({ shop_name: order.shop_name });
+        if (m) order.shop_id = m.shop_id;
       }
-      db.orders.unshift(order);
-      saveDb(db);
+      await orders.insertOne(order);
       console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}`);
       return json(res, 200, { ok: true, order_id: order.order_id });
     }
 
     if (req.method === "GET" && p === "/orders") {
-      let list = db.orders.slice();
       const shopId = u.searchParams.get("shop_id");
-      if (shopId) {
-        list = list.filter(
-          (o) => o.shop_id === shopId || (!o.shop_id && matchShopName(db, shopId, o.shop_name))
-        );
-      }
+      const query = shopId ? { shop_id: shopId } : {};
+      const list = await orders.find(query).sort({ placed_at: -1 }).toArray();
+      list.forEach((o) => delete o._id);
       return json(res, 200, { ok: true, orders: list });
     }
 
@@ -317,38 +303,41 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const orderId = String(body.order_id || "");
       const status = Number(body.status);
-      const o = db.orders.find((x) => x.order_id === orderId);
-      if (!o) return json(res, 404, { ok: false, error: "Order not found" });
-      o.status = status;
-      o.status_label = body.status_label || "";
-      saveDb(db);
+      const result = await orders.updateOne(
+        { order_id: orderId },
+        { $set: { status, status_label: body.status_label || "" } }
+      );
+      if (result.matchedCount === 0) return json(res, 404, { ok: false, error: "Order not found" });
       return json(res, 200, { ok: true, order_id: orderId, status });
     }
 
     // ----- Shops (from merchants + meta) -----
     if (req.method === "GET" && p === "/shops") {
-      const shops = Object.keys(db.merchants).map((phone) => {
-        const m = db.merchants[phone];
-        const meta = getShopMeta(db, m.shop_id);
-        return {
-          id: m.shop_id,
-          name: m.shop_name,
-          category: m.category || "General",
-          location: m.location || "",
-          // Real rating only — 0 = New (no fake 4.0)
-          rating: meta.rating_count > 0 ? meta.rating : 0,
-          logo_uri: meta.logo_uri || "",
-          banner_uri: meta.banner_uri || "",
-        };
-      });
+      const all = await merchants.find({}).toArray();
+      const shops = await Promise.all(
+        all.map(async (m) => {
+          const meta = await getShopMeta(m.shop_id);
+          return {
+            id: m.shop_id,
+            name: m.shop_name,
+            category: m.category || "General",
+            location: m.location || "",
+            // Real rating only — 0 = New (no fake 4.0)
+            rating: meta.rating_count > 0 ? meta.rating : 0,
+            logo_uri: meta.logo_uri || "",
+            banner_uri: meta.banner_uri || "",
+          };
+        })
+      );
       return json(res, 200, { ok: true, shops });
     }
 
     // ----- Products -----
     if (req.method === "GET" && p === "/products") {
-      let list = db.products.slice();
       const shopId = u.searchParams.get("shop_id");
-      if (shopId) list = list.filter((pr) => pr.shop_id === shopId);
+      const query = shopId ? { shop_id: shopId } : {};
+      const list = await products.find(query).toArray();
+      list.forEach((pr) => delete pr._id);
       return json(res, 200, { ok: true, products: list });
     }
 
@@ -381,10 +370,7 @@ const server = http.createServer(async (req, res) => {
         sold_out,
         updated_at: Date.now(),
       };
-      const idx = db.products.findIndex((x) => x.id === id);
-      if (idx >= 0) db.products[idx] = prod;
-      else db.products.unshift(prod);
-      saveDb(db);
+      await products.updateOne({ id }, { $set: prod, $setOnInsert: { _id: id } }, { upsert: true });
       console.log(`[PRODUCT] save ${id} shop=${shop_id} "${name}"`);
       return json(res, 200, { ok: true, product: prod });
     }
@@ -404,32 +390,32 @@ const server = http.createServer(async (req, res) => {
         id = String(body.id || "");
         shop_id = String(body.shop_id || "");
       }
-      const before = db.products.length;
-      db.products = db.products.filter((pr) => {
-        if (pr.id !== id) return true;
-        if (shop_id && pr.shop_id !== shop_id) return true;
-        return false;
-      });
-      if (db.products.length === before) {
+      const query = shop_id ? { id, shop_id } : { id };
+      const result = await products.deleteOne(query);
+      if (result.deletedCount === 0) {
         return json(res, 404, { ok: false, error: "Product not found" });
       }
-      saveDb(db);
       console.log(`[PRODUCT] deleted ${id}`);
       return json(res, 200, { ok: true, deleted: id });
     }
 
     if (req.method === "GET" && p === "/key") {
-      return json(res, 200, { ok: true, api_key: db.api_key });
+      return json(res, 200, { ok: true, api_key: DEFAULT_API_KEY });
     }
 
     // Debug snapshot (authenticated)
     if (req.method === "GET" && p === "/admin/stats") {
+      const [mCount, prCount, oCount] = await Promise.all([
+        merchants.countDocuments(),
+        products.countDocuments(),
+        orders.countDocuments(),
+      ]);
       return json(res, 200, {
         ok: true,
-        merchants: Object.keys(db.merchants).length,
-        products: db.products.length,
-        orders: db.orders.length,
-        db_file: DB_FILE,
+        merchants: mCount,
+        products: prCount,
+        orders: oCount,
+        db: db.databaseName,
       });
     }
 
@@ -440,31 +426,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function matchShopName(db, shopId, shopName) {
-  for (const phone of Object.keys(db.merchants)) {
-    const m = db.merchants[phone];
-    if (m.shop_id === shopId && m.shop_name === shopName) return true;
-  }
-  return false;
-}
-
-ensureDb();
-const db0 = loadDb();
-// Keep API key stable for apps
-if (db0.api_key !== DEFAULT_API_KEY) {
-  console.log("[WARN] db api_key differs from DEFAULT — apps use Config.API_KEY");
-}
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("");
-  console.log("═══════════════════════════════════════════");
-  console.log("  Nexora Server — persistent storage");
-  console.log("  Local:    http://127.0.0.1:" + PORT);
-  console.log("  DB file:  " + DB_FILE);
-  console.log("  API KEY:  " + db0.api_key);
-  console.log("═══════════════════════════════════════════");
-  console.log("  Merchants:", Object.keys(db0.merchants).length);
-  console.log("  Products: ", db0.products.length);
-  console.log("  Orders:   ", db0.orders.length);
-  console.log("");
-});
+connectDb()
+  .then(() => {
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log("");
+      console.log("═══════════════════════════════════════════");
+      console.log("  Nexora Server — MongoDB Atlas storage");
+      console.log("  Local:    http://127.0.0.1:" + PORT);
+      console.log("  API KEY:  " + DEFAULT_API_KEY);
+      console.log("═══════════════════════════════════════════");
+      console.log("");
+    });
+  })
+  .catch((e) => {
+    console.error("[FATAL] Mongo connect failed:", e.message);
+    process.exit(1);
+  });
