@@ -165,29 +165,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { ok: false, error: "Invalid or missing X-API-Key" });
     }
 
-    // ----- OTP (SMS via poller in background — never block login) -----
+    // ----- OTP (real SMS via phone poller — no tunnel needed) -----
     if (req.method === "POST" && p === "/send-otp") {
       const body = await readBody(req);
-      let phone = String(body.phone || "").trim().replace(/\D/g, "");
-      if (phone.length > 10) phone = phone.slice(-10);
+      const phone = String(body.phone || "").trim();
       if (phone.length < 10) return json(res, 400, { ok: false, error: "Valid phone required" });
 
       const code = genOtp();
-      // Save OTP first so verify works even if SMS fails
-      db.otps[phone] = { code, expires: Date.now() + 5 * 60 * 1000 };
-      saveDb(db);
-
       const reqId = "otp_" + ++otpReqCounter + "_" + Date.now();
       otpQueue.set(reqId, { phone, code, status: "pending", reason: "", createdAt: Date.now() });
-      console.log(`[OTP] ${phone} → ${code} (queued ${reqId} for SMS poller)`);
+      console.log(`[OTP] queued ${reqId} for ${phone}`);
 
-      // Instant response — poller sends SMS in background if running
-      // App shows otp_dev on screen when SMS is delayed
-      return json(res, 200, {
-        ok: true,
-        message: "OTP generated",
-        otp_dev: code,
-      });
+      // Wait up to 15s for the phone poller to pick this up and confirm real SMS delivery
+      const timeoutMs = 45000;
+      const start = Date.now();
+      let job = otpQueue.get(reqId);
+      while (Date.now() - start < timeoutMs) {
+        job = otpQueue.get(reqId);
+        if (!job || job.status === "sent" || job.status === "failed") break;
+        await sleep(400);
+      }
+      otpQueue.delete(reqId);
+
+      if (!job || job.status !== "sent") {
+        const reason = job && job.reason ? job.reason : "Phone did not confirm delivery in time (is the poller app running?)";
+        console.log(`[OTP] ${reqId} FAILED — ${reason}`);
+        return json(res, 502, { ok: false, error: "OTP send failed: " + reason });
+      }
+
+      db.otps[phone] = { code, expires: Date.now() + 5 * 60 * 1000 };
+      saveDb(db);
+      console.log(`[OTP] ${reqId} sent to ${phone}`);
+      return json(res, 200, { ok: true, message: "OTP sent" });
     }
 
     // Phone poller: "do you have an OTP for me to send?"
@@ -548,7 +557,7 @@ if (db0.api_key !== DEFAULT_API_KEY) {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("═══════════════════════════════════════════");
-  console.log("  Nexora Server — Part2 instant OTP + poller");
+  console.log("  Nexora Server — persistent storage");
   console.log("  Local:    http://127.0.0.1:" + PORT);
   console.log("  DB file:  " + DB_FILE);
   console.log("  API KEY:  " + db0.api_key);
