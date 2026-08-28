@@ -7,6 +7,7 @@
  */
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -19,6 +20,130 @@ const DB_TMP = path.join(DATA_DIR, "db.json.tmp");
 
 // Fixed key so apps Config.java keep working (change later if needed)
 const DEFAULT_API_KEY = "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ";
+
+// ----- MessageCentral VerifyNow OTP (Render Environment) -----
+// MC_CUSTOMER_ID   = customerId from MessageCentral dashboard
+// MC_BASE64_KEY    = base64 encrypted key / password from dashboard
+// MC_SHOW_DEV_OTP  = "1" only while testing (returns otp_dev — MessageCentral generates OTP so this is unused for MC path)
+const MC_CUSTOMER_ID = (process.env.MC_CUSTOMER_ID || "").trim();
+const MC_BASE64_KEY = (process.env.MC_BASE64_KEY || "").trim();
+const MC_SHOW_DEV_OTP = process.env.MC_SHOW_DEV_OTP === "1" || process.env.MC_SHOW_DEV_OTP === "true";
+
+function mcEnabled() {
+  return MC_CUSTOMER_ID.length > 2 && MC_BASE64_KEY.length > 5;
+}
+
+let mcAuthToken = null;
+let mcTokenAt = 0;
+const MC_TOKEN_TTL_MS = 50 * 60 * 1000; // refresh ~50 min
+
+function httpsJson(method, hostname, path, headers, bodyStr) {
+  return new Promise((resolve) => {
+    const opts = {
+      hostname,
+      path,
+      method,
+      headers: headers || {},
+      timeout: 25000,
+    };
+    if (bodyStr != null) {
+      opts.headers["Content-Length"] = Buffer.byteLength(bodyStr);
+    }
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch (e) { parsed = { raw: data }; }
+        resolve({ status: res.statusCode, body: parsed, raw: data });
+      });
+    });
+    req.on("error", (e) => resolve({ status: 0, error: e.message }));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve({ status: 0, error: "timeout" });
+    });
+    if (bodyStr != null) req.write(bodyStr);
+    req.end();
+  });
+}
+
+/** Step 1: auth token */
+async function mcGetToken() {
+  if (mcAuthToken && Date.now() - mcTokenAt < MC_TOKEN_TTL_MS) return mcAuthToken;
+  const path =
+    "/auth/v1/authentication/token?customerId=" +
+    encodeURIComponent(MC_CUSTOMER_ID) +
+    "&key=" +
+    encodeURIComponent(MC_BASE64_KEY) +
+    "&scope=NEW&country=91";
+  const r = await httpsJson("GET", "cpaas.messagecentral.com", path, { accept: "*/*" }, null);
+  const token = r.body && (r.body.token || (r.body.data && r.body.data.token));
+  if (!token) {
+    console.log("[MC] token fail", r.status, r.error || r.raw || r.body);
+    return null;
+  }
+  mcAuthToken = token;
+  mcTokenAt = Date.now();
+  console.log("[MC] token OK");
+  return token;
+}
+
+/** Step 2: send OTP — returns { ok, verificationId, error } */
+async function mcSendOtp(mobile10) {
+  const token = await mcGetToken();
+  if (!token) return { ok: false, error: "MessageCentral token failed — check MC_CUSTOMER_ID / MC_BASE64_KEY" };
+  const path =
+    "/verification/v3/send?countryCode=91&flowType=SMS&mobileNumber=" +
+    encodeURIComponent(mobile10) +
+    "&otpLength=6";
+  const r = await httpsJson(
+    "POST",
+    "cpaas.messagecentral.com",
+    path,
+    { authToken: token, accept: "*/*" },
+    ""
+  );
+  const data = r.body && r.body.data;
+  const verificationId = data && data.verificationId;
+  if (verificationId) {
+    return { ok: true, verificationId: String(verificationId) };
+  }
+  const msg =
+    (r.body && (r.body.message || r.body.responseMessage || r.body.errorMessage)) ||
+    r.error ||
+    r.raw ||
+    "send failed";
+  // 800 = MAXIMUM_LIMIT_REACHED
+  return { ok: false, error: String(msg), status: r.status, body: r.body };
+}
+
+/** Step 3: validate OTP */
+async function mcValidateOtp(verificationId, otpCode) {
+  const token = await mcGetToken();
+  if (!token) return { ok: false, error: "token failed" };
+  const path =
+    "/verification/v3/validateOtp?verificationId=" +
+    encodeURIComponent(verificationId) +
+    "&code=" +
+    encodeURIComponent(otpCode);
+  const r = await httpsJson(
+    "GET",
+    "cpaas.messagecentral.com",
+    path,
+    { authToken: token, accept: "*/*" },
+    null
+  );
+  const data = r.body && r.body.data;
+  const status = data && data.verificationStatus;
+  if (status === "VERIFICATION_COMPLETED") return { ok: true };
+  const msg =
+    (r.body && (r.body.message || r.body.responseMessage)) ||
+    status ||
+    r.error ||
+    "invalid otp";
+  return { ok: false, error: String(msg), status: r.status };
+}
 
 function randomKey() {
   return crypto.randomBytes(24).toString("base64url");
@@ -119,6 +244,8 @@ function genOtp() {
 // ----- OTP delivery queue (phone poller sends the real SMS) -----
 const otpQueue = new Map(); // req_id -> { phone, code, status, reason, createdAt }
 let otpReqCounter = 0;
+const otpLastSend = new Map(); // phone -> timestamp
+const OTP_COOLDOWN_MS = 60000; // 1 min per phone
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -165,38 +292,74 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { ok: false, error: "Invalid or missing X-API-Key" });
     }
 
-    // ----- OTP (real SMS via phone poller — no tunnel needed) -----
+    // ----- OTP: MSG91 (preferred) or poller fallback -----
     if (req.method === "POST" && p === "/send-otp") {
       const body = await readBody(req);
-      const phone = String(body.phone || "").trim();
+      let phone = String(body.phone || "").trim().replace(/\D/g, "");
+      if (phone.length > 10) phone = phone.slice(-10);
       if (phone.length < 10) return json(res, 400, { ok: false, error: "Valid phone required" });
 
+      const last = otpLastSend.get(phone) || 0;
+      if (Date.now() - last < OTP_COOLDOWN_MS) {
+        const wait = Math.ceil((OTP_COOLDOWN_MS - (Date.now() - last)) / 1000);
+        const existing = db.otps[phone];
+        if (existing && Date.now() < existing.expires) {
+          const resp = {
+            ok: true,
+            message: "OTP already sent — wait " + wait + "s before resend",
+            cooldown: wait,
+          };
+          if (existing.code && (MC_SHOW_DEV_OTP || !mcEnabled())) resp.otp_dev = existing.code;
+          return json(res, 200, resp);
+        }
+        return json(res, 429, { ok: false, error: "Wait " + wait + "s before requesting another OTP" });
+      }
+      otpLastSend.set(phone, Date.now());
+
+      for (const [id, job] of otpQueue) {
+        if (job.phone === phone && job.status === "pending") otpQueue.delete(id);
+      }
+
+      // --- MessageCentral path (preferred) ---
+      if (mcEnabled()) {
+        console.log(`[OTP] MessageCentral send → ${phone}`);
+        const result = await mcSendOtp(phone);
+        if (result.ok && result.verificationId) {
+          db.otps[phone] = {
+            provider: "messagecentral",
+            verificationId: result.verificationId,
+            expires: Date.now() + 5 * 60 * 1000,
+          };
+          saveDb(db);
+          console.log(`[OTP] MC OK ${phone} vid=${result.verificationId}`);
+          return json(res, 200, {
+            ok: true,
+            message: "OTP sent via SMS",
+            provider: "messagecentral",
+          });
+        }
+        console.log(`[OTP] MC FAIL ${phone}:`, result.error || result.body);
+        return json(res, 502, {
+          ok: false,
+          error: "OTP SMS failed: " + (result.error || "MessageCentral error"),
+          provider: "messagecentral",
+          detail: result.status || null,
+        });
+      }
+
+      // --- Fallback: local OTP + poller queue ---
       const code = genOtp();
+      db.otps[phone] = { code, expires: Date.now() + 5 * 60 * 1000, provider: "poller" };
+      saveDb(db);
       const reqId = "otp_" + ++otpReqCounter + "_" + Date.now();
       otpQueue.set(reqId, { phone, code, status: "pending", reason: "", createdAt: Date.now() });
-      console.log(`[OTP] queued ${reqId} for ${phone}`);
-
-      // Wait up to 15s for the phone poller to pick this up and confirm real SMS delivery
-      const timeoutMs = 45000;
-      const start = Date.now();
-      let job = otpQueue.get(reqId);
-      while (Date.now() - start < timeoutMs) {
-        job = otpQueue.get(reqId);
-        if (!job || job.status === "sent" || job.status === "failed") break;
-        await sleep(400);
-      }
-      otpQueue.delete(reqId);
-
-      if (!job || job.status !== "sent") {
-        const reason = job && job.reason ? job.reason : "Phone did not confirm delivery in time (is the poller app running?)";
-        console.log(`[OTP] ${reqId} FAILED — ${reason}`);
-        return json(res, 502, { ok: false, error: "OTP send failed: " + reason });
-      }
-
-      db.otps[phone] = { code, expires: Date.now() + 5 * 60 * 1000 };
-      saveDb(db);
-      console.log(`[OTP] ${reqId} sent to ${phone}`);
-      return json(res, 200, { ok: true, message: "OTP sent" });
+      console.log(`[OTP] ${phone} → ${code} (poller — set MC_CUSTOMER_ID + MC_BASE64_KEY for MessageCentral)`);
+      return json(res, 200, {
+        ok: true,
+        message: "OTP generated (poller mode — configure MessageCentral on Render)",
+        otp_dev: code,
+        provider: "poller",
+      });
     }
 
     // Phone poller: "do you have an OTP for me to send?"
@@ -227,7 +390,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && p === "/verify-otp") {
       const body = await readBody(req);
-      const phone = String(body.phone || "").trim();
+      let phone = String(body.phone || "").trim().replace(/\D/g, "");
+      if (phone.length > 10) phone = phone.slice(-10);
       const otp = String(body.otp || "").trim();
       const rec = db.otps[phone];
       if (!rec) return json(res, 400, { ok: false, error: "No OTP requested for this phone" });
@@ -236,7 +400,22 @@ const server = http.createServer(async (req, res) => {
         saveDb(db);
         return json(res, 400, { ok: false, error: "OTP expired" });
       }
-      if (rec.code !== otp) return json(res, 400, { ok: false, error: "Wrong OTP" });
+
+      // MessageCentral: validate on their API
+      if (rec.provider === "messagecentral" && rec.verificationId) {
+        const v = await mcValidateOtp(rec.verificationId, otp);
+        if (!v.ok) {
+          return json(res, 400, { ok: false, error: v.error || "Wrong OTP" });
+        }
+        delete db.otps[phone];
+        saveDb(db);
+        return json(res, 200, { ok: true, message: "Verified", provider: "messagecentral" });
+      }
+
+      // Local / poller OTP
+      if (!rec.code || rec.code !== otp) {
+        return json(res, 400, { ok: false, error: "Wrong OTP" });
+      }
       delete db.otps[phone];
       saveDb(db);
       return json(res, 200, { ok: true, message: "Verified" });
@@ -517,6 +696,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, deleted: id });
     }
 
+    if (req.method === "POST" && p === "/otp-queue/clear") {
+      const n = otpQueue.size || (Array.isArray(otpQueue) ? otpQueue.length : 0);
+      if (otpQueue.clear) otpQueue.clear();
+      else if (Array.isArray(otpQueue)) otpQueue.length = 0;
+      console.log("[OTP] queue cleared", n);
+      return json(res, 200, { ok: true, cleared: n });
+    }
+
     if (req.method === "GET" && p === "/key") {
       return json(res, 200, { ok: true, api_key: db.api_key });
     }
@@ -557,7 +744,7 @@ if (db0.api_key !== DEFAULT_API_KEY) {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("═══════════════════════════════════════════");
-  console.log("  Nexora Server — persistent storage");
+  console.log("  Nexora Server — MessageCentral OTP + poller fallback");
   console.log("  Local:    http://127.0.0.1:" + PORT);
   console.log("  DB file:  " + DB_FILE);
   console.log("  API KEY:  " + db0.api_key);
@@ -565,6 +752,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("  Merchants:", Object.keys(db0.merchants).length);
   console.log("  Products: ", db0.products.length);
   console.log("  Orders:   ", db0.orders.length);
+  console.log("  OTP:      ", mcEnabled() ? "MessageCentral" : "poller (set MC_CUSTOMER_ID + MC_BASE64_KEY)");
   console.log("");
 });
 
