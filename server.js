@@ -1,33 +1,70 @@
 /**
- * Nexora API Server — persistent JSON database
- * Data file: data/db.json (atomic write)
+ * Nexora API Server
+ * Storage: MongoDB when MONGODB_URI / MONGO_URI is set, else data/db.json
  *
- * Run:  node server.js
- * Or:   npm start
+ * Run:  npm install && node server.js
  */
-
-const http = require("http");
-const https = require("https");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const { URL } = require("url");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 const DATA_DIR = path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const DB_TMP = path.join(DATA_DIR, "db.json.tmp");
 
-// Fixed key so apps Config.java keep working (change later if needed)
-const DEFAULT_API_KEY = "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ";
+// Fixed key so apps Config.java keep working
+const DEFAULT_API_KEY = (
+  process.env.API_KEY ||
+  process.env.X_API_KEY ||
+  "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ"
+).trim();
+
+// ----- MongoDB (Render Environment) -----
+// Set ONE of: MONGODB_URI | MONGO_URI | MONGO_URL
+// Optional: MONGO_DB_NAME (default: nexora)
+const MONGODB_URI = (
+  process.env.MONGODB_URI ||
+  process.env.MONGO_URI ||
+  process.env.MONGO_URL ||
+  process.env.DATABASE_URL ||
+  ""
+).trim();
+const MONGO_DB_NAME = (process.env.MONGO_DB_NAME || process.env.MONGODB_DB || "nexora").trim();
+const MONGO_COLLECTION = (process.env.MONGO_COLLECTION || "app_state").trim();
+
+let mongoClient = null;
+let mongoCol = null;
+let memDb = null;
+let saveChain = Promise.resolve();
+
+function mongoEnabled() {
+  return MONGODB_URI.length > 10;
+}
+
+async function connectMongo() {
+  if (!mongoEnabled()) return false;
+  if (mongoCol) return true;
+  const { MongoClient } = require("mongodb");
+  mongoClient = new MongoClient(MONGODB_URI, {
+    maxPoolSize: 5,
+    serverSelectionTimeoutMS: 15000,
+  });
+  await mongoClient.connect();
+  const db = mongoClient.db(MONGO_DB_NAME);
+  mongoCol = db.collection(MONGO_COLLECTION);
+  console.log("[MONGO] connected db=" + MONGO_DB_NAME + " col=" + MONGO_COLLECTION);
+  return true;
+}
 
 // ----- MessageCentral VerifyNow OTP (Render Environment) -----
 // MC_CUSTOMER_ID   = customerId from MessageCentral dashboard
 // MC_BASE64_KEY    = base64 encrypted key / password from dashboard
-// MC_SHOW_DEV_OTP  = "1" only while testing (returns otp_dev — MessageCentral generates OTP so this is unused for MC path)
+// MC_SHOW_DEV_OTP  = "1" only while testing
 const MC_CUSTOMER_ID = (process.env.MC_CUSTOMER_ID || "").trim();
 const MC_BASE64_KEY = (process.env.MC_BASE64_KEY || "").trim();
-const MC_SHOW_DEV_OTP = process.env.MC_SHOW_DEV_OTP === "1" || process.env.MC_SHOW_DEV_OTP === "true";
+const MC_SHOW_DEV_OTP =
+  process.env.MC_SHOW_DEV_OTP === "1" ||
+  process.env.MC_SHOW_DEV_OTP === "true" ||
+  process.env.SURVEY_MODE === "1" ||
+  process.env.SURVEY_MODE === "true";
 
 function mcEnabled() {
   return MC_CUSTOMER_ID.length > 2 && MC_BASE64_KEY.length > 5;
@@ -149,6 +186,7 @@ function randomKey() {
   return crypto.randomBytes(24).toString("base64url");
 }
 
+
 function emptyDb() {
   return {
     api_key: DEFAULT_API_KEY,
@@ -156,39 +194,84 @@ function emptyDb() {
     merchants: {},
     orders: [],
     products: [],
-    // shop_id -> { logo_uri, banner_uri, rating, rating_count }
     shop_meta: {},
   };
 }
 
-function ensureDb() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(emptyDb(), null, 2), "utf8");
-  }
+function normalizeDb(db) {
+  if (!db || typeof db !== "object") db = emptyDb();
+  if (!db.api_key) db.api_key = DEFAULT_API_KEY;
+  if (!db.otps) db.otps = {};
+  if (!db.merchants) db.merchants = {};
+  if (!Array.isArray(db.orders)) db.orders = [];
+  if (!Array.isArray(db.products)) db.products = [];
+  if (!db.shop_meta) db.shop_meta = {};
+  return db;
 }
 
-function loadDb() {
-  ensureDb();
+async function loadDb() {
+  if (memDb) return memDb;
+
+  if (mongoEnabled()) {
+    try {
+      await connectMongo();
+      const doc = await mongoCol.findOne({ _id: "main" });
+      if (doc && doc.data) {
+        memDb = normalizeDb(doc.data);
+        console.log("[MONGO] loaded merchants=" + Object.keys(memDb.merchants).length +
+          " products=" + memDb.products.length + " orders=" + memDb.orders.length);
+        return memDb;
+      }
+      memDb = emptyDb();
+      await mongoCol.updateOne(
+        { _id: "main" },
+        { $set: { data: memDb, updated_at: new Date() } },
+        { upsert: true }
+      );
+      console.log("[MONGO] initialized empty state");
+      return memDb;
+    } catch (e) {
+      console.error("[MONGO] load failed, fallback empty:", e.message);
+      memDb = emptyDb();
+      return memDb;
+    }
+  }
+
+  // File fallback (local dev / no Mongo)
   try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DB_FILE)) {
+      fs.writeFileSync(DB_FILE, JSON.stringify(emptyDb(), null, 2), "utf8");
+    }
     const raw = fs.readFileSync(DB_FILE, "utf8");
-    const db = JSON.parse(raw);
-    if (!db.api_key) db.api_key = DEFAULT_API_KEY;
-    if (!db.otps) db.otps = {};
-    if (!db.merchants) db.merchants = {};
-    if (!Array.isArray(db.orders)) db.orders = [];
-    if (!Array.isArray(db.products)) db.products = [];
-    if (!db.shop_meta) db.shop_meta = {};
-    return db;
+    memDb = normalizeDb(JSON.parse(raw));
+    return memDb;
   } catch (e) {
-    console.error("[DB] load failed, using empty:", e.message);
-    return emptyDb();
+    console.error("[DB] file load failed:", e.message);
+    memDb = emptyDb();
+    return memDb;
   }
 }
 
-/** Atomic write — avoids corrupt db.json on crash mid-write */
 function saveDb(db) {
-  ensureDb();
+  memDb = normalizeDb(db);
+  // Serialize writes so concurrent requests don't clobber
+  saveChain = saveChain.then(() => persistDb(memDb)).catch((e) => {
+    console.error("[DB] save error:", e.message);
+  });
+  return saveChain;
+}
+
+async function persistDb(db) {
+  if (mongoEnabled() && mongoCol) {
+    await mongoCol.updateOne(
+      { _id: "main" },
+      { $set: { data: db, updated_at: new Date() } },
+      { upsert: true }
+    );
+    return;
+  }
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   const json = JSON.stringify(db, null, 2);
   fs.writeFileSync(DB_TMP, json, "utf8");
   fs.renameSync(DB_TMP, DB_FILE);
@@ -272,7 +355,7 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  const db = loadDb();
+  const db = await loadDb();
   const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
   const p = u.pathname.replace(/\/+$/, "") || "/";
 
@@ -281,7 +364,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         ok: true,
         service: "nexora-server",
-        storage: "data/db.json",
+        storage: mongoEnabled() ? ("mongodb:" + MONGO_DB_NAME) : "data/db.json",
         merchants: Object.keys(db.merchants).length,
         orders: db.orders.length,
         products: db.products.length,
@@ -339,12 +422,16 @@ const server = http.createServer(async (req, res) => {
           });
         }
         console.log(`[OTP] MC FAIL ${phone}:`, result.error || result.body);
-        return json(res, 502, {
-          ok: false,
-          error: "OTP SMS failed: " + (result.error || "MessageCentral error"),
-          provider: "messagecentral",
-          detail: result.status || null,
-        });
+        // Keep OTP in DB; return otp_dev so survey/demo register still works if SMS fails
+        db.otps[phone] = { code: genOtp(), expires: Date.now() + 5 * 60 * 1000, provider: "local_fallback" };
+        // reuse code already generated above if present in closure — regenerate linked below
+        const resp = {
+          ok: true,
+          message: "OTP ready",
+          provider: "local_fallback",
+        };
+        if (MC_SHOW_DEV_OTP) resp.otp_dev = db.otps[phone].code;
+        return json(res, 200, resp);
       }
 
       // --- Fallback: local OTP + poller queue ---
@@ -354,12 +441,13 @@ const server = http.createServer(async (req, res) => {
       const reqId = "otp_" + ++otpReqCounter + "_" + Date.now();
       otpQueue.set(reqId, { phone, code, status: "pending", reason: "", createdAt: Date.now() });
       console.log(`[OTP] ${phone} → ${code} (poller — set MC_CUSTOMER_ID + MC_BASE64_KEY for MessageCentral)`);
-      return json(res, 200, {
+      const pollerResp = {
         ok: true,
-        message: "OTP generated (poller mode — configure MessageCentral on Render)",
-        otp_dev: code,
+        message: "OTP generated",
         provider: "poller",
-      });
+      };
+      if (MC_SHOW_DEV_OTP) pollerResp.otp_dev = code;
+      return json(res, 200, pollerResp);
     }
 
     // Phone poller: "do you have an OTP for me to send?"
@@ -564,14 +652,22 @@ const server = http.createServer(async (req, res) => {
       const o = db.orders.find((x) => x.order_id === orderId);
       if (!o) return json(res, 404, { ok: false, error: "Order not found" });
 
-      // Out for delivery → generate 4-digit delivery OTP
+      // Out for delivery → delivery OTP + unique QR token for delivery boy app
       if (status === 2) {
         o.delivery_otp = String(Math.floor(1000 + Math.random() * 9000));
+        o.delivery_token = o.delivery_token || ("NXD" + crypto.randomBytes(8).toString("hex").toUpperCase());
         o.status = 2;
         o.status_label = "Out for delivery";
         saveDb(db);
-        console.log(`[ORDER] ${orderId} OUT otp=${o.delivery_otp}`);
-        return json(res, 200, { ok: true, order_id: orderId, status: 2, delivery_otp: o.delivery_otp });
+        console.log(`[ORDER] ${orderId} OUT otp=${o.delivery_otp} token=${o.delivery_token}`);
+        return json(res, 200, {
+          ok: true,
+          order_id: orderId,
+          status: 2,
+          delivery_otp: o.delivery_otp,
+          delivery_token: o.delivery_token,
+          qr_payload: "NEXORA|" + o.delivery_token,
+        });
       }
 
       // Mark Delivered → require OTP if one was issued
@@ -603,23 +699,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, order_id: orderId, status, delivery_otp: o.delivery_otp || null });
     }
 
-    // ----- Shops (from merchants + meta) -----
+    // ----- Shops (from merchants + meta; also recover shop_ids seen on products) -----
     if (req.method === "GET" && p === "/shops") {
-      const shops = Object.keys(db.merchants).map((phone) => {
+      const byId = {};
+      for (const phone of Object.keys(db.merchants)) {
         const m = db.merchants[phone];
+        if (!m || !m.shop_id) continue;
         const meta = getShopMeta(db, m.shop_id);
-        return {
+        byId[m.shop_id] = {
           id: m.shop_id,
-          name: m.shop_name,
+          name: m.shop_name || "Shop",
           category: m.category || "General",
           location: m.location || "",
-          // Real rating only — 0 = New (no fake 4.0)
           rating: meta.rating_count > 0 ? meta.rating : 0,
           logo_uri: meta.logo_uri || "",
           banner_uri: meta.banner_uri || "",
         };
-      });
-      return json(res, 200, { ok: true, shops });
+      }
+      // If merchant row was lost (disk reset) but products remain, still expose shop
+      for (const pr of db.products) {
+        const sid = pr && pr.shop_id;
+        if (!sid || byId[sid]) continue;
+        byId[sid] = {
+          id: sid,
+          name: pr.shop_name || "Shop",
+          category: "General",
+          location: "",
+          rating: 0,
+          logo_uri: "",
+          banner_uri: "",
+        };
+      }
+      return json(res, 200, { ok: true, shops: Object.values(byId) });
     }
 
     // ----- Products -----
@@ -632,7 +743,12 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && p === "/products") {
       const body = await readBody(req);
-      const id = String(body.id || genId("p"));
+      let id = String(body.id || "").trim() || genId("p");
+      // If client sent an id that collides and body says it's a new product, mint unique
+      if (db.products.some((x) => x.id === id) && body.as_new === true) {
+        id = genId("p");
+      }
+      if (!id || id === "null" || id === "undefined") id = genId("p");
       const shop_id = String(body.shop_id || "").trim();
       const name = String(body.name || "").trim();
       const price = Number(body.price) || 0;
@@ -647,6 +763,28 @@ const server = http.createServer(async (req, res) => {
       }
       if (!name) return json(res, 400, { ok: false, error: "Product name required" });
       if (!shop_id) return json(res, 400, { ok: false, error: "shop_id required" });
+
+      // Keep a merchant/shop row alive so customer /shops does not go empty after restarts
+      let hasMerchant = false;
+      for (const phone of Object.keys(db.merchants)) {
+        if (db.merchants[phone].shop_id === shop_id) {
+          hasMerchant = true;
+          break;
+        }
+      }
+      if (!hasMerchant) {
+        const stubPhone = "shopstub_" + shop_id;
+        db.merchants[stubPhone] = {
+          pin: "",
+          shop_id,
+          shop_name: String(body.shop_name || "Shop").trim() || "Shop",
+          category: String(body.category || "General").trim() || "General",
+          location: String(body.location || "").trim(),
+          created_at: Date.now(),
+          stub: true,
+        };
+        getShopMeta(db, shop_id);
+      }
 
       const prod = {
         id,
@@ -719,6 +857,56 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+
+    // ----- Delivery boy: scan QR / enter token → customer contact + address -----
+    if (req.method === "GET" && p === "/delivery/lookup") {
+      let code = String(u.searchParams.get("code") || u.searchParams.get("token") || "").trim().toUpperCase();
+      // Accept payload form NEXORA|TOKEN or bare token
+      if (code.includes("|")) code = code.split("|").pop().trim();
+      code = code.replace(/[^A-Z0-9]/g, "");
+      if (code.length < 6) return json(res, 400, { ok: false, error: "Invalid delivery code" });
+      const o = db.orders.find((x) => String(x.delivery_token || "").toUpperCase() === code);
+      if (!o) return json(res, 404, { ok: false, error: "Code not found or order not out for delivery" });
+      if (Number(o.status) === 3 || Number(o.status) === 4 || Number(o.status) === 5) {
+        return json(res, 400, { ok: false, error: "Order already closed", status: o.status });
+      }
+      return json(res, 200, {
+        ok: true,
+        order_id: o.order_id,
+        shop_name: o.shop_name || "",
+        customer_name: o.customer_name || "",
+        customer_phone: o.customer_phone || "",
+        full_address: o.full_address || [o.address_line1, o.address_line2, o.landmark, o.city, o.pincode].filter(Boolean).join(", "),
+        address_line1: o.address_line1 || "",
+        address_line2: o.address_line2 || "",
+        landmark: o.landmark || "",
+        city: o.city || "",
+        pincode: o.pincode || "",
+        total: o.total || 0,
+        items: Array.isArray(o.items) ? o.items : [],
+        status: o.status,
+        delivery_otp_hint: o.delivery_otp ? "Ask customer for 4-digit delivery OTP" : null,
+      });
+    }
+
+    if (req.method === "POST" && p === "/delivery/complete") {
+      const body = await readBody(req);
+      let code = String(body.code || body.token || "").trim().toUpperCase();
+      if (code.includes("|")) code = code.split("|").pop().trim();
+      code = code.replace(/[^A-Z0-9]/g, "");
+      const otp = String(body.otp || body.delivery_otp || "").trim();
+      const o = db.orders.find((x) => String(x.delivery_token || "").toUpperCase() === code);
+      if (!o) return json(res, 404, { ok: false, error: "Code not found" });
+      if (o.delivery_otp && otp !== String(o.delivery_otp)) {
+        return json(res, 400, { ok: false, error: "Invalid delivery OTP", need_otp: true });
+      }
+      o.status = 3;
+      o.status_label = "Delivered";
+      o.delivered_at = Date.now();
+      saveDb(db);
+      return json(res, 200, { ok: true, order_id: o.order_id, status: 3 });
+    }
+
     return json(res, 404, { ok: false, error: "Not found: " + p });
   } catch (e) {
     console.error(e);
@@ -735,13 +923,17 @@ function matchShopName(db, shopId, shopName) {
 }
 
 ensureDb();
-const db0 = loadDb();
+/* db0 async below */ null;
 // Keep API key stable for apps
 if (db0.api_key !== DEFAULT_API_KEY) {
   console.log("[WARN] db api_key differs from DEFAULT — apps use Config.API_KEY");
 }
 
-server.listen(PORT, "0.0.0.0", () => {
+console.log("[ENV] MONGODB_URI=" + (mongoEnabled() ? "set" : "MISSING"));
+    console.log("[ENV] MC_CUSTOMER_ID=" + (MC_CUSTOMER_ID ? "set" : "MISSING"));
+    console.log("[ENV] MC_BASE64_KEY=" + (MC_BASE64_KEY ? "set" : "MISSING"));
+    console.log("[ENV] API_KEY=" + (DEFAULT_API_KEY ? "set" : "MISSING"));
+    server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("═══════════════════════════════════════════");
   console.log("  Nexora Server — MessageCentral OTP + poller fallback");
@@ -756,3 +948,31 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("");
 });
 
+(async () => {
+  try {
+    if (mongoEnabled()) {
+      await connectMongo();
+    }
+    const db0 = await loadDb();
+    if (db0.api_key !== DEFAULT_API_KEY) {
+      console.log("[WARN] db api_key differs from DEFAULT — apps use Config.API_KEY");
+    }
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log("");
+      console.log("═══════════════════════════════════════════");
+      console.log("  Nexora Server — MongoDB + MessageCentral OTP");
+      console.log("  Local:    http://127.0.0.1:" + PORT);
+      console.log("  Storage:  " + (mongoEnabled() ? ("MongoDB " + MONGO_DB_NAME + "/" + MONGO_COLLECTION) : DB_FILE));
+      console.log("  API KEY:  " + db0.api_key);
+      console.log("═══════════════════════════════════════════");
+      console.log("  Merchants:", Object.keys(db0.merchants).length);
+      console.log("  Products: ", db0.products.length);
+      console.log("  Orders:   ", db0.orders.length);
+      console.log("  OTP:      ", mcEnabled() ? "MessageCentral" : "poller / local");
+      console.log("");
+    });
+  } catch (e) {
+    console.error("[FATAL] startup failed:", e);
+    process.exit(1);
+  }
+})();
