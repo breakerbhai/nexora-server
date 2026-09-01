@@ -942,57 +942,40 @@ function matchShopName(db, shopId, shopName) {
   return false;
 }
 
-ensureDb();
-/* db0 async below */ null;
-// Keep API key stable for apps
-if (db0.api_key !== DEFAULT_API_KEY) {
-  console.log("[WARN] db api_key differs from DEFAULT — apps use Config.API_KEY");
-}
 
-console.log("[ENV] MONGODB_URI=" + (mongoEnabled() ? "set" : "MISSING"));
-    console.log("[ENV] MC_CUSTOMER_ID=" + (MC_CUSTOMER_ID ? "set" : "MISSING"));
-    console.log("[ENV] MC_BASE64_KEY=" + (MC_BASE64_KEY ? "set" : "MISSING"));
-    console.log("[ENV] API_KEY=" + (DEFAULT_API_KEY ? "set" : "MISSING"));
-    server.listen(PORT, "0.0.0.0", () => {
-  console.log("");
-  console.log("═══════════════════════════════════════════");
-  console.log("  Nexora Server — MessageCentral OTP + poller fallback");
-  console.log("  Local:    http://127.0.0.1:" + PORT);
-  console.log("  DB file:  " + DB_FILE);
-  console.log("  API KEY:  " + db0.api_key);
-  console.log("═══════════════════════════════════════════");
-  console.log("  Merchants:", Object.keys(db0.merchants).length);
-  console.log("  Products: ", db0.products.length);
-  console.log("  Orders:   ", db0.orders.length);
-  console.log("  OTP:      ", mcEnabled() ? "MessageCentral" : "poller (set MC_CUSTOMER_ID + MC_BASE64_KEY)");
-  console.log("");
-});
-
+// ----- Boot -----
 (async () => {
   try {
     if (mongoEnabled()) {
-      await connectMongo();
+      try {
+        await connectMongo();
+      } catch (e) {
+        console.error("[MONGO] connect at boot failed:", e.message);
+      }
     }
     const db0 = await loadDb();
     if (db0.api_key !== DEFAULT_API_KEY) {
       console.log("[WARN] db api_key differs from DEFAULT — apps use Config.API_KEY");
     }
+    console.log("[ENV] MONGODB_URI=" + (mongoEnabled() ? "set" : "MISSING"));
+    console.log("[ENV] MC_CUSTOMER_ID=" + (typeof MC_CUSTOMER_ID !== "undefined" && MC_CUSTOMER_ID ? "set" : "MISSING"));
+    console.log("[ENV] MC_BASE64_KEY=" + (typeof MC_BASE64_KEY !== "undefined" && MC_BASE64_KEY ? "set" : "MISSING"));
+    console.log("[ENV] API_KEY=" + (DEFAULT_API_KEY ? "set" : "MISSING"));
+
     server.listen(PORT, "0.0.0.0", () => {
       console.log("");
       console.log("═══════════════════════════════════════════");
-      console.log("  Nexora Server — MongoDB + MessageCentral OTP");
-      console.log("  Local:    http://127.0.0.1:" + PORT);
-      console.log("  Storage:  " + (mongoEnabled() ? ("MongoDB " + MONGO_DB_NAME + "/" + MONGO_COLLECTION) : DB_FILE));
-      console.log("  API KEY:  " + db0.api_key);
+      console.log("  Nexora Server");
+      console.log("  Port:     " + PORT);
+      console.log("  Storage:  " + (mongoEnabled() ? "MongoDB" : DB_FILE));
+      console.log("  Merchants:", Object.keys(db0.merchants || {}).length);
+      console.log("  Products: ", (db0.products || []).length);
+      console.log("  Orders:   ", (db0.orders || []).length);
       console.log("═══════════════════════════════════════════");
-      console.log("  Merchants:", Object.keys(db0.merchants).length);
-      console.log("  Products: ", db0.products.length);
-      console.log("  Orders:   ", db0.orders.length);
-      console.log("  OTP:      ", mcEnabled() ? "MessageCentral" : "poller / local");
       console.log("");
     });
   } catch (e) {
-    console.error("[FATAL] startup failed:", e);
+    console.error("[BOOT] failed:", e);
     process.exit(1);
   }
 })();
