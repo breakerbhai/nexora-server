@@ -5,6 +5,13 @@
  * Run:  npm install && node server.js
  */
 
+const http = require("http");
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { URL } = require("url");
+
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 const DATA_DIR = path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
