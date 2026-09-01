@@ -652,49 +652,59 @@ const server = http.createServer(async (req, res) => {
       const o = db.orders.find((x) => x.order_id === orderId);
       if (!o) return json(res, 404, { ok: false, error: "Order not found" });
 
-      // Out for delivery → delivery OTP + unique QR token for delivery boy app
-      if (status === 2) {
+      // Status map (must match merchant app):
+      // 0 Pending, 1 Confirmed, 2 Packed, 3 Out for delivery, 4 Delivered, 5 Rejected
+
+      // Out for delivery → OTP + QR token for delivery boy app
+      if (status === 3) {
         o.delivery_otp = String(Math.floor(1000 + Math.random() * 9000));
         o.delivery_token = o.delivery_token || ("NXD" + crypto.randomBytes(8).toString("hex").toUpperCase());
-        o.status = 2;
+        o.status = 3;
         o.status_label = "Out for delivery";
+        o.status_step = 3;
         saveDb(db);
         console.log(`[ORDER] ${orderId} OUT otp=${o.delivery_otp} token=${o.delivery_token}`);
         return json(res, 200, {
           ok: true,
           order_id: orderId,
-          status: 2,
+          status: 3,
+          status_step: 3,
           delivery_otp: o.delivery_otp,
           delivery_token: o.delivery_token,
           qr_payload: "NEXORA|" + o.delivery_token,
         });
       }
 
-      // Mark Delivered → require OTP if one was issued
-      if (status === 3) {
+      // Mark Delivered (merchant-side) → require OTP if issued
+      if (status === 4) {
         const got = String(body.otp || body.delivery_otp || "").trim();
-        if (o.delivery_otp && got !== String(o.delivery_otp)) {
+        if (o.delivery_otp && got && got !== String(o.delivery_otp)) {
           return json(res, 400, { ok: false, error: "Invalid delivery OTP", need_otp: true });
         }
-        o.status = 3;
+        o.status = 4;
+        o.status_step = 4;
         o.status_label = "Delivered";
         o.delivered_at = Date.now();
         saveDb(db);
-        return json(res, 200, { ok: true, order_id: orderId, status: 3 });
+        return json(res, 200, { ok: true, order_id: orderId, status: 4, status_step: 4 });
       }
 
-      // Customer received
+      // Rejected
       if (status === 5) {
         o.status = 5;
-        o.status_label = "Received";
-        o.received_at = Date.now();
+        o.status_step = 5;
+        o.status_label = "Rejected";
+        o.reject_reason = body.reject_reason || body.reason || "";
+        o.rejected_at = Date.now();
         saveDb(db);
         return json(res, 200, { ok: true, order_id: orderId, status: 5 });
       }
 
       o.status = status;
-      o.status_label = body.status_label || "";
-      if (status === 4) o.status_label = "Cancelled";
+      o.status_step = status;
+      o.status_label = body.status_label || ({
+        0: "Pending", 1: "Confirmed", 2: "Packed", 3: "Out for delivery", 4: "Delivered", 5: "Rejected"
+      })[status] || String(status);
       saveDb(db);
       return json(res, 200, { ok: true, order_id: orderId, status, delivery_otp: o.delivery_otp || null });
     }
@@ -900,11 +910,14 @@ const server = http.createServer(async (req, res) => {
       if (o.delivery_otp && otp !== String(o.delivery_otp)) {
         return json(res, 400, { ok: false, error: "Invalid delivery OTP", need_otp: true });
       }
-      o.status = 3;
+      o.status = 4;
+      o.status_step = 4;
       o.status_label = "Delivered";
       o.delivered_at = Date.now();
+      o.courier_name = body.courier_name || body.delivery_name || o.courier_name || "";
+      o.courier_phone = body.courier_phone || body.delivery_phone || o.courier_phone || "";
       saveDb(db);
-      return json(res, 200, { ok: true, order_id: o.order_id, status: 3 });
+      return json(res, 200, { ok: true, order_id: o.order_id, status: 4, status_step: 4 });
     }
 
     return json(res, 404, { ok: false, error: "Not found: " + p });
@@ -976,3 +989,4 @@ console.log("[ENV] MONGODB_URI=" + (mongoEnabled() ? "set" : "MISSING"));
     process.exit(1);
   }
 })();
+
