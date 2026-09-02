@@ -24,6 +24,106 @@ const DEFAULT_API_KEY = (
   "TTRHsRQivU8HkpF2X5wHdqKw8-10TSpQ"
 ).trim();
 
+// ----- Firebase Cloud Messaging (optional Hybrid push) -----
+// Env on Render:
+//   FIREBASE_SERVICE_ACCOUNT_JSON = full JSON string of service account
+//   OR FIREBASE_PROJECT_ID + path not needed if JSON set
+// Without these, server runs normally; push is skipped (no crash).
+let firebaseAdmin = null;
+let fcmReady = false;
+
+function initFirebaseAdmin() {
+  if (fcmReady || firebaseAdmin) return fcmReady;
+  try {
+    const raw = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+    if (!raw) {
+      console.log("[FCM] not configured — set FIREBASE_SERVICE_ACCOUNT_JSON for push");
+      return false;
+    }
+    const sa = JSON.parse(raw);
+    firebaseAdmin = require("firebase-admin");
+    if (!firebaseAdmin.apps.length) {
+      firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert(sa) });
+    }
+    fcmReady = true;
+    console.log("[FCM] firebase-admin ready project=" + (sa.project_id || ""));
+    return true;
+  } catch (e) {
+    console.error("[FCM] init failed:", e.message);
+    fcmReady = false;
+    return false;
+  }
+}
+
+function ensureFcmStore(db) {
+  if (!db.fcm_tokens || typeof db.fcm_tokens !== "object") db.fcm_tokens = {};
+  return db;
+}
+
+/** role: customer | merchant | delivery ; key: phone last10 or shop_id */
+function registerFcmToken(db, role, key, token, meta) {
+  ensureFcmStore(db);
+  let id = String(key || "");
+  if (role !== "merchant" || !id.startsWith("shop") && id.replace(/\D/g, "").length >= 10) {
+    const digits = id.replace(/\D/g, "");
+    if (digits.length >= 10) id = digits.slice(-10);
+  }
+  const k = String(role || "customer") + ":" + id;
+  if (!token || token.length < 20) return false;
+  if (!db.fcm_tokens[k]) db.fcm_tokens[k] = [];
+  const list = db.fcm_tokens[k].filter((t) => t !== token);
+  list.unshift(token);
+  db.fcm_tokens[k] = list.slice(0, 5);
+  if (meta && meta.shop_id) {
+    const sk = "merchant_shop:" + meta.shop_id;
+    if (!db.fcm_tokens[sk]) db.fcm_tokens[sk] = [];
+    const sl = db.fcm_tokens[sk].filter((t) => t !== token);
+    sl.unshift(token);
+    db.fcm_tokens[sk] = sl.slice(0, 5);
+  }
+  return true;
+}
+
+async function sendFcmToKeys(db, keys, title, body, data) {
+  if (!initFirebaseAdmin()) return { ok: false, skipped: true };
+  ensureFcmStore(db);
+  const tokens = [];
+  for (const key of keys) {
+    const list = db.fcm_tokens[key] || [];
+    for (const t of list) if (t && !tokens.includes(t)) tokens.push(t);
+  }
+  if (!tokens.length) return { ok: false, empty: true };
+  const payload = {
+    tokens,
+    notification: { title: String(title || "Nexora"), body: String(body || "") },
+    data: Object.fromEntries(
+      Object.entries(data || {}).map(([k, v]) => [String(k), String(v)])
+    ),
+    android: { priority: "high" },
+  };
+  try {
+    const resp = await firebaseAdmin.messaging().sendEachForMulticast(payload);
+    console.log("[FCM] sent success=" + resp.successCount + " fail=" + resp.failureCount);
+    return { ok: true, success: resp.successCount, failure: resp.failureCount };
+  } catch (e) {
+    console.error("[FCM] send error:", e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+function notifyOrderParties(db, order, title, body) {
+  const keys = [];
+  const phone = String(order.customer_phone || "").replace(/\D/g, "");
+  if (phone) keys.push("customer:" + phone.slice(-10));
+  if (order.shop_id) keys.push("merchant_shop:" + order.shop_id);
+  // fire and forget
+  Promise.resolve(sendFcmToKeys(db, keys, title, body, {
+    order_id: order.order_id || "",
+    status: String(order.status_step != null ? order.status_step : order.status || ""),
+  })).catch(() => {});
+}
+
+
 // ----- MongoDB (Render Environment) -----
 // Set ONE of: MONGODB_URI | MONGO_URI | MONGO_URL
 // Optional: MONGO_DB_NAME (default: nexora)
@@ -202,6 +302,7 @@ function emptyDb() {
     orders: [],
     products: [],
     shop_meta: {},
+    fcm_tokens: {},
   };
 }
 
@@ -213,6 +314,7 @@ function normalizeDb(db) {
   if (!Array.isArray(db.orders)) db.orders = [];
   if (!Array.isArray(db.products)) db.products = [];
   if (!db.shop_meta) db.shop_meta = {};
+  if (!db.fcm_tokens || typeof db.fcm_tokens !== "object") db.fcm_tokens = {};
   return db;
 }
 
@@ -383,6 +485,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- OTP: MSG91 (preferred) or poller fallback -----
+    
+    // ----- FCM device token register (Hybrid push) -----
+    if (req.method === "POST" && p === "/fcm/register") {
+      const body = await readBody(req);
+      const role = String(body.role || "customer").toLowerCase();
+      const phone = String(body.phone || body.customer_phone || "").replace(/\D/g, "");
+      const shopId = String(body.shop_id || "");
+      const token = String(body.token || body.fcm_token || "").trim();
+      const key = role === "merchant" ? (shopId || phone) : phone;
+      if (!token) return json(res, 400, { ok: false, error: "token required" });
+      if (!key) return json(res, 400, { ok: false, error: "phone or shop_id required" });
+      ensureFcmStore(db);
+      registerFcmToken(db, role, key, token, { shop_id: shopId });
+      saveDb(db);
+      return json(res, 200, { ok: true, fcm_configured: initFirebaseAdmin() });
+    }
+
     if (req.method === "POST" && p === "/send-otp") {
       const body = await readBody(req);
       let phone = String(body.phone || "").trim().replace(/\D/g, "");
@@ -604,6 +723,7 @@ const server = http.createServer(async (req, res) => {
         order_id: body.order_id || genId("NX"),
         shop_name: body.shop_name || "",
         shop_id: body.shop_id || "",
+        shop_category: body.shop_category || body.category || "",
         total: Number(body.total) || 0,
         source: body.source || "",
         placed_at: body.placed_at || Date.now(),
@@ -636,6 +756,7 @@ const server = http.createServer(async (req, res) => {
       db.orders.unshift(order);
       saveDb(db);
       console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}`);
+      notifyOrderParties(db, order, "New order", "Order " + order.order_id + " — ₹" + order.total);
       return json(res, 200, { ok: true, order_id: order.order_id });
     }
 
@@ -659,6 +780,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, orders: list });
     }
 
+    // Customer return request (post-delivery). Grocery-like shops blocked client-side too.
+    if (req.method === "POST" && p === "/orders/return") {
+      const body = await readBody(req);
+      const orderId = String(body.order_id || "");
+      const reason = String(body.reason || "").trim();
+      const o = db.orders.find((x) => x.order_id === orderId);
+      if (!o) return json(res, 404, { ok: false, error: "Order not found" });
+      if (Number(o.status) !== 4 && Number(o.status_step) !== 4) {
+        return json(res, 400, { ok: false, error: "Only delivered orders can be returned" });
+      }
+      const cat = String(body.shop_category || o.shop_category || o.category || "").toLowerCase();
+      const groceryHints = ["grocery", "kirana", "food", "fresh", "dairy", "vegetable", "fruit", "meat", "bakery"];
+      if (groceryHints.some((g) => cat.includes(g))) {
+        return json(res, 400, { ok: false, error: "Grocery / food orders are not eligible for return. Contact shop for damaged/wrong item refund." });
+      }
+      if (o.return_status === "requested" || o.return_status === "approved") {
+        return json(res, 400, { ok: false, error: "Return already requested" });
+      }
+      // 7-day window from delivered_at
+      const deliveredAt = Number(o.delivered_at || o.placed_at || 0);
+      const week = 7 * 24 * 60 * 60 * 1000;
+      if (deliveredAt && Date.now() - deliveredAt > week) {
+        return json(res, 400, { ok: false, error: "Return window (7 days) expired" });
+      }
+      o.return_status = "requested";
+      o.return_reason = reason || "Not specified";
+      o.return_requested_at = Date.now();
+      saveDb(db);
+      console.log("[RETURN] requested", orderId, reason);
+      return json(res, 200, { ok: true, order_id: orderId, return_status: "requested" });
+    }
+
     if (req.method === "POST" && p === "/orders/status") {
       const body = await readBody(req);
       const orderId = String(body.order_id || "");
@@ -678,6 +831,7 @@ const server = http.createServer(async (req, res) => {
         o.status_step = 3;
         saveDb(db);
         console.log(`[ORDER] ${orderId} OUT otp=${o.delivery_otp} token=${o.delivery_token}`);
+        notifyOrderParties(db, o, "Out for delivery", "Order " + orderId + " is on the way");
         return json(res, 200, {
           ok: true,
           order_id: orderId,
@@ -700,6 +854,7 @@ const server = http.createServer(async (req, res) => {
         o.status_label = "Delivered";
         o.delivered_at = Date.now();
         saveDb(db);
+        notifyOrderParties(db, o, "Delivered", "Order " + orderId + " delivered");
         return json(res, 200, { ok: true, order_id: orderId, status: 4, status_step: 4 });
       }
 
@@ -711,7 +866,22 @@ const server = http.createServer(async (req, res) => {
         o.reject_reason = body.reject_reason || body.reason || "";
         o.rejected_at = Date.now();
         saveDb(db);
+        notifyOrderParties(db, o, "Order rejected", o.reject_reason || "Shop rejected order");
         return json(res, 200, { ok: true, order_id: orderId, status: 5 });
+      }
+
+      // Customer cancelled (before out-for-delivery ideally)
+      if (status === 6) {
+        if (Number(o.status) >= 3) {
+          return json(res, 400, { ok: false, error: "Cannot cancel — already out for delivery or delivered" });
+        }
+        o.status = 6;
+        o.status_step = 6;
+        o.status_label = "Cancelled";
+        o.cancel_reason = body.reason || body.cancel_reason || "Cancelled by customer";
+        o.cancelled_at = Date.now();
+        saveDb(db);
+        return json(res, 200, { ok: true, order_id: orderId, status: 6 });
       }
 
       o.status = status;
@@ -1051,6 +1221,7 @@ function matchShopName(db, shopId, shopName) {
     console.log("[ENV] API_KEY=" + (DEFAULT_API_KEY ? "set" : "MISSING"));
 
     server.listen(PORT, "0.0.0.0", () => {
+      initFirebaseAdmin();
       console.log("");
       console.log("═══════════════════════════════════════════");
       console.log("  Nexora Server");
@@ -1067,4 +1238,3 @@ function matchShopName(db, shopId, shopName) {
     process.exit(1);
   }
 })();
-
