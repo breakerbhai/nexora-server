@@ -716,15 +716,33 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === "GET" && p === "/config/fees") {
+      return json(res, 200, {
+        ok: true,
+        delivery_fee: Number(process.env.DELIVERY_FEE) || 35,
+        free_delivery_above: Number(process.env.FREE_DELIVERY_ABOVE) || 499,
+      });
+    }
+
     // ----- Orders -----
     if (req.method === "POST" && p === "/orders") {
       const body = await readBody(req);
+
+      // Idempotency: if this order_id already exists, don't create a duplicate
+      // (protects against retry/double-tap creating two orders with the same id).
+      const reqOrderId = String(body.order_id || "").trim();
+      if (reqOrderId) {
+        const existing = db.orders.find((x) => x.order_id === reqOrderId);
+        if (existing) {
+          return json(res, 200, { ok: true, order_id: existing.order_id, duplicate: true });
+        }
+      }
+
       const order = {
-        order_id: body.order_id || genId("NX"),
+        order_id: reqOrderId || genId("NX"),
         shop_name: body.shop_name || "",
         shop_id: body.shop_id || "",
         shop_category: body.shop_category || body.category || "",
-        total: Number(body.total) || 0,
         source: body.source || "",
         placed_at: body.placed_at || Date.now(),
         customer_name: body.customer_name || "",
@@ -737,7 +755,6 @@ const server = http.createServer(async (req, res) => {
         full_address: body.full_address || "",
         lat: Number(body.lat) || 0,
         lng: Number(body.lng) || 0,
-        items: Array.isArray(body.items) ? body.items : [],
         status: 0,
         status_step: 0,
       };
@@ -753,11 +770,75 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
+
+      // ----- Server-side price recompute -----
+      // Never trust client-sent item price / order total. Look up each item's
+      // real price from the product catalog (db.products), which the merchant
+      // controls server-side. If a product can't be verified against the
+      // catalog, the order is still accepted (so a stale/legacy cart doesn't
+      // just fail silently) but flagged price_verified:false and NOT trusted
+      // as final — merchant app should show that flag before confirming.
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+      let serverTotal = 0;
+      let allVerified = true;
+      const items = rawItems.map((it) => {
+        const productId = String((it && it.product_id) || "");
+        const qty = Math.max(1, Number(it && it.quantity) || 1);
+        const product = productId
+          ? db.products.find((pr) => pr.id === productId && (!order.shop_id || pr.shop_id === order.shop_id))
+          : null;
+        let unitPrice;
+        let verified;
+        let soldOut = false;
+        if (product) {
+          unitPrice = Number(product.price) || 0;
+          verified = true;
+          soldOut = !!product.sold_out;
+        } else {
+          // Fallback to client-sent price only when we truly cannot verify
+          // (e.g. product removed after add-to-cart). Order is flagged.
+          unitPrice = Number(it && it.price) || 0;
+          verified = false;
+          allVerified = false;
+        }
+        serverTotal += unitPrice * qty;
+        return {
+          product_id: productId,
+          name: (product && product.name) || (it && it.name) || "",
+          price: unitPrice,
+          client_price: Number(it && it.price) || 0,
+          quantity: qty,
+          color: (it && it.color) || "",
+          size: (it && it.size) || "",
+          variant: (it && it.variant) || "",
+          verified,
+          sold_out: soldOut,
+        };
+      });
+
+      const clientTotal = Number(body.total) || 0;
+      order.items = items;
+      order.total = Math.round(serverTotal * 100) / 100;
+      order.client_reported_total = clientTotal;
+      order.price_verified = allVerified;
+      order.price_mismatch = Math.abs(order.total - clientTotal) > 0.5;
+      const hasSoldOut = items.some((it) => it.sold_out);
+      order.has_sold_out_item = hasSoldOut;
+
       db.orders.unshift(order);
       saveDb(db);
-      console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}`);
+      console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}` +
+        (order.price_mismatch ? ` (client sent ₹${clientTotal} — MISMATCH)` : "") +
+        (!allVerified ? " [UNVERIFIED ITEM]" : ""));
       notifyOrderParties(db, order, "New order", "Order " + order.order_id + " — ₹" + order.total);
-      return json(res, 200, { ok: true, order_id: order.order_id });
+      return json(res, 200, {
+        ok: true,
+        order_id: order.order_id,
+        total: order.total,
+        price_verified: order.price_verified,
+        price_mismatch: order.price_mismatch,
+        has_sold_out_item: order.has_sold_out_item,
+      });
     }
 
     if (req.method === "GET" && p === "/orders") {
