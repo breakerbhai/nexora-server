@@ -50,3 +50,4 @@ Without `FIREBASE_SERVICE_ACCOUNT_JSON`, API still works; push is skipped.
 ## Do not do
 - Move all orders to Firestore only (unnecessary rewrite)
 - Put payment verification only on the phone
+
