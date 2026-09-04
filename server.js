@@ -13,6 +13,14 @@ const crypto = require("crypto");
 const { URL } = require("url");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
+// Platform delivery fee (₹). Override with env DELIVERY_FEE
+
+// Admin kill-switch + money (platform control — only with ADMIN_SECRET)
+const ADMIN_SECRET = (process.env.ADMIN_SECRET || process.env.ADMIN_PIN || "258000").trim();
+const COMMISSION_RATE = Math.min(0.5, Math.max(0, Number(process.env.COMMISSION_RATE || 0.05)));
+
+const DELIVERY_FEE = Math.max(0, Number(process.env.DELIVERY_FEE || 35));
+const FREE_DELIVERY_ABOVE = Math.max(0, Number(process.env.FREE_DELIVERY_ABOVE || 499));
 const DATA_DIR = path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const DB_TMP = path.join(DATA_DIR, "db.json.tmp");
@@ -55,8 +63,38 @@ function initFirebaseAdmin() {
   }
 }
 
+function isMerchantDisabled(m) {
+  if (!m || typeof m !== "object") return false;
+  return m.disabled === true || m.terminated === true || m.active === false;
+}
+
+function findMerchantByShopId(db, shopId) {
+  if (!shopId) return null;
+  for (const phone of Object.keys(db.merchants || {})) {
+    const m = db.merchants[phone];
+    if (m && String(m.shop_id) === String(shopId)) return { phone, merchant: m };
+  }
+  return null;
+}
+
+function ensurePlatform(db) {
+  if (!db.platform || typeof db.platform !== "object") {
+    db.platform = { customer: true, merchant: true, delivery: true };
+  }
+  for (const k of ["customer", "merchant", "delivery"]) {
+    if (typeof db.platform[k] !== "boolean") db.platform[k] = true;
+  }
+  return db.platform;
+}
+
 function ensureFcmStore(db) {
   if (!db.fcm_tokens || typeof db.fcm_tokens !== "object") db.fcm_tokens = {};
+  if (!db.platform || typeof db.platform !== "object") {
+    db.platform = { customer: true, merchant: true, delivery: true };
+  }
+  for (const k of ["customer", "merchant", "delivery"]) {
+    if (typeof db.platform[k] !== "boolean") db.platform[k] = true;
+  }
   return db;
 }
 
@@ -303,6 +341,7 @@ function emptyDb() {
     products: [],
     shop_meta: {},
     fcm_tokens: {},
+    platform: { customer: true, merchant: true, delivery: true },
   };
 }
 
@@ -315,6 +354,12 @@ function normalizeDb(db) {
   if (!Array.isArray(db.products)) db.products = [];
   if (!db.shop_meta) db.shop_meta = {};
   if (!db.fcm_tokens || typeof db.fcm_tokens !== "object") db.fcm_tokens = {};
+  if (!db.platform || typeof db.platform !== "object") {
+    db.platform = { customer: true, merchant: true, delivery: true };
+  }
+  for (const k of ["customer", "merchant", "delivery"]) {
+    if (typeof db.platform[k] !== "boolean") db.platform[k] = true;
+  }
   return db;
 }
 
@@ -487,6 +532,15 @@ const server = http.createServer(async (req, res) => {
     // ----- OTP: MSG91 (preferred) or poller fallback -----
     
     // ----- FCM device token register (Hybrid push) -----
+    if (req.method === "GET" && p === "/config/fees") {
+      return json(res, 200, {
+        ok: true,
+        delivery_fee: DELIVERY_FEE,
+        free_delivery_above: FREE_DELIVERY_ABOVE,
+        currency: "INR",
+      });
+    }
+
     if (req.method === "POST" && p === "/fcm/register") {
       const body = await readBody(req);
       const role = String(body.role || "customer").toLowerCase();
@@ -716,33 +770,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (req.method === "GET" && p === "/config/fees") {
-      return json(res, 200, {
-        ok: true,
-        delivery_fee: Number(process.env.DELIVERY_FEE) || 35,
-        free_delivery_above: Number(process.env.FREE_DELIVERY_ABOVE) || 499,
-      });
-    }
-
     // ----- Orders -----
     if (req.method === "POST" && p === "/orders") {
       const body = await readBody(req);
-
-      // Idempotency: if this order_id already exists, don't create a duplicate
-      // (protects against retry/double-tap creating two orders with the same id).
-      const reqOrderId = String(body.order_id || "").trim();
-      if (reqOrderId) {
-        const existing = db.orders.find((x) => x.order_id === reqOrderId);
-        if (existing) {
-          return json(res, 200, { ok: true, order_id: existing.order_id, duplicate: true });
-        }
-      }
-
       const order = {
-        order_id: reqOrderId || genId("NX"),
+        order_id: body.order_id || genId("NX"),
         shop_name: body.shop_name || "",
         shop_id: body.shop_id || "",
         shop_category: body.shop_category || body.category || "",
+        total: Number(body.total) || 0,
         source: body.source || "",
         placed_at: body.placed_at || Date.now(),
         customer_name: body.customer_name || "",
@@ -755,9 +791,29 @@ const server = http.createServer(async (req, res) => {
         full_address: body.full_address || "",
         lat: Number(body.lat) || 0,
         lng: Number(body.lng) || 0,
+        items: Array.isArray(body.items) ? body.items : [],
         status: 0,
         status_step: 0,
+        subtotal: 0,
+        delivery_fee: 0,
+        discount: Number(body.discount) || 0,
+        mrp_total: Number(body.mrp_total) || 0,
       };
+      // Server-side fee (do not trust client-only total long-term)
+      {
+        let sub = 0;
+        for (const it of order.items) {
+          const price = Number(it.price || 0);
+          const qty = Number(it.quantity || it.qty || 1);
+          sub += price * qty;
+        }
+        if (!sub) sub = Number(body.subtotal || body.total) || 0;
+        order.subtotal = Math.round(sub * 100) / 100;
+        const fee = order.subtotal >= FREE_DELIVERY_ABOVE ? 0 : DELIVERY_FEE;
+        order.delivery_fee = fee;
+        order.total = Math.round((order.subtotal + fee - (order.discount || 0)) * 100) / 100;
+        if (order.total < 0) order.total = 0;
+      }
       if (!order.full_address) {
         order.full_address = [order.address_line1, order.address_line2, order.landmark, order.city, order.pincode]
           .filter(Boolean).join(", ");
@@ -770,75 +826,11 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
-
-      // ----- Server-side price recompute -----
-      // Never trust client-sent item price / order total. Look up each item's
-      // real price from the product catalog (db.products), which the merchant
-      // controls server-side. If a product can't be verified against the
-      // catalog, the order is still accepted (so a stale/legacy cart doesn't
-      // just fail silently) but flagged price_verified:false and NOT trusted
-      // as final — merchant app should show that flag before confirming.
-      const rawItems = Array.isArray(body.items) ? body.items : [];
-      let serverTotal = 0;
-      let allVerified = true;
-      const items = rawItems.map((it) => {
-        const productId = String((it && it.product_id) || "");
-        const qty = Math.max(1, Number(it && it.quantity) || 1);
-        const product = productId
-          ? db.products.find((pr) => pr.id === productId && (!order.shop_id || pr.shop_id === order.shop_id))
-          : null;
-        let unitPrice;
-        let verified;
-        let soldOut = false;
-        if (product) {
-          unitPrice = Number(product.price) || 0;
-          verified = true;
-          soldOut = !!product.sold_out;
-        } else {
-          // Fallback to client-sent price only when we truly cannot verify
-          // (e.g. product removed after add-to-cart). Order is flagged.
-          unitPrice = Number(it && it.price) || 0;
-          verified = false;
-          allVerified = false;
-        }
-        serverTotal += unitPrice * qty;
-        return {
-          product_id: productId,
-          name: (product && product.name) || (it && it.name) || "",
-          price: unitPrice,
-          client_price: Number(it && it.price) || 0,
-          quantity: qty,
-          color: (it && it.color) || "",
-          size: (it && it.size) || "",
-          variant: (it && it.variant) || "",
-          verified,
-          sold_out: soldOut,
-        };
-      });
-
-      const clientTotal = Number(body.total) || 0;
-      order.items = items;
-      order.total = Math.round(serverTotal * 100) / 100;
-      order.client_reported_total = clientTotal;
-      order.price_verified = allVerified;
-      order.price_mismatch = Math.abs(order.total - clientTotal) > 0.5;
-      const hasSoldOut = items.some((it) => it.sold_out);
-      order.has_sold_out_item = hasSoldOut;
-
       db.orders.unshift(order);
       saveDb(db);
-      console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}` +
-        (order.price_mismatch ? ` (client sent ₹${clientTotal} — MISMATCH)` : "") +
-        (!allVerified ? " [UNVERIFIED ITEM]" : ""));
+      console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}`);
       notifyOrderParties(db, order, "New order", "Order " + order.order_id + " — ₹" + order.total);
-      return json(res, 200, {
-        ok: true,
-        order_id: order.order_id,
-        total: order.total,
-        price_verified: order.price_verified,
-        price_mismatch: order.price_mismatch,
-        has_sold_out_item: order.has_sold_out_item,
-      });
+      return json(res, 200, { ok: true, order_id: order.order_id });
     }
 
     if (req.method === "GET" && p === "/orders") {
@@ -979,6 +971,7 @@ const server = http.createServer(async (req, res) => {
       const byId = {};
       for (const phone of Object.keys(db.merchants)) {
         const m = db.merchants[phone];
+        if (isMerchantDisabled(m)) continue;
         if (!m || !m.shop_id) continue;
         const meta = getShopMeta(db, m.shop_id);
         byId[m.shop_id] = {
@@ -1122,6 +1115,167 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Debug snapshot (authenticated)
+    
+    // ----- Platform kill-switch (apps check this on open) -----
+    if (req.method === "GET" && p === "/platform/status") {
+      ensurePlatform(db);
+      return json(res, 200, {
+        ok: true,
+        platform: db.platform,
+        customer: !!db.platform.customer,
+        merchant: !!db.platform.merchant,
+        delivery: !!db.platform.delivery,
+        message: "Apps must stop if their flag is false",
+      });
+    }
+
+    // Admin: enable/disable any app (requires ADMIN_SECRET)
+    if (req.method === "POST" && p === "/admin/platform") {
+      const body = await readBody(req);
+      const secret = String(body.admin_secret || body.secret || req.headers["x-admin-secret"] || "").trim();
+      if (!secret || secret !== ADMIN_SECRET) {
+        return json(res, 403, { ok: false, error: "Invalid admin secret" });
+      }
+      ensurePlatform(db);
+      const app = String(body.app || body.target || "").toLowerCase();
+      if (!["customer", "merchant", "delivery"].includes(app)) {
+        return json(res, 400, { ok: false, error: "app must be customer|merchant|delivery" });
+      }
+      const enabled = body.enabled === true || body.enabled === 1 || body.enabled === "1" || body.enabled === "true";
+      db.platform[app] = enabled;
+      saveDb(db);
+      console.log("[PLATFORM]", app, "=", enabled);
+      return json(res, 200, { ok: true, platform: db.platform });
+    }
+
+    // Admin money overview
+    if (req.method === "GET" && p === "/admin/money") {
+      const secret = String(u.searchParams.get("admin_secret") || req.headers["x-admin-secret"] || "").trim();
+      if (secret && secret !== ADMIN_SECRET) {
+        return json(res, 403, { ok: false, error: "Invalid admin secret" });
+      }
+      const orders = db.orders || [];
+      let gmv = 0, deliveryFees = 0, delivered = 0, active = 0, rejected = 0;
+      for (const o of orders) {
+        const tot = Number(o.total) || 0;
+        gmv += tot;
+        deliveryFees += Number(o.delivery_fee) || 0;
+        const st = Number(o.status_step != null ? o.status_step : o.status);
+        if (st === 4) delivered++;
+        else if (st === 5 || st === 6) rejected++;
+        else active++;
+      }
+      const commission = Math.round(gmv * COMMISSION_RATE * 100) / 100;
+      return json(res, 200, {
+        ok: true,
+        gmv: Math.round(gmv * 100) / 100,
+        delivery_fees: Math.round(deliveryFees * 100) / 100,
+        commission_rate: COMMISSION_RATE,
+        estimated_commission: commission,
+        order_count: orders.length,
+        delivered,
+        active,
+        rejected,
+        merchants: Object.keys(db.merchants || {}).length,
+        products: (db.products || []).length,
+        platform: (db.platform || {}),
+      });
+    }
+
+
+    
+    // List all merchants (admin)
+    if (req.method === "GET" && p === "/admin/merchants") {
+      const secret = String(u.searchParams.get("admin_secret") || req.headers["x-admin-secret"] || "").trim();
+      if (secret && secret !== ADMIN_SECRET) {
+        return json(res, 403, { ok: false, error: "Invalid admin secret" });
+      }
+      const list = [];
+      for (const phone of Object.keys(db.merchants || {})) {
+        const m = db.merchants[phone];
+        if (!m) continue;
+        list.push({
+          phone,
+          shop_id: m.shop_id || "",
+          shop_name: m.shop_name || m.name || "Shop",
+          category: m.category || "",
+          location: m.location || "",
+          disabled: isMerchantDisabled(m),
+          created_at: m.created_at || 0,
+        });
+      }
+      list.sort((a, b) => String(a.shop_name).localeCompare(String(b.shop_name)));
+      return json(res, 200, { ok: true, count: list.length, merchants: list });
+    }
+
+    // Terminate / restore one merchant shop
+    if (req.method === "POST" && p === "/admin/merchant") {
+      const body = await readBody(req);
+      const secret = String(body.admin_secret || body.secret || req.headers["x-admin-secret"] || "").trim();
+      if (!secret || secret !== ADMIN_SECRET) {
+        return json(res, 403, { ok: false, error: "Invalid admin secret" });
+      }
+      const shopId = String(body.shop_id || "").trim();
+      const phone = String(body.phone || "").replace(/\D/g, "");
+      let found = null;
+      if (shopId) found = findMerchantByShopId(db, shopId);
+      if (!found && phone) {
+        const m = db.merchants[phone] || db.merchants[phone.slice(-10)];
+        if (m) found = { phone: db.merchants[phone] ? phone : phone.slice(-10), merchant: m };
+      }
+      if (!found) return json(res, 404, { ok: false, error: "Merchant not found" });
+      const action = String(body.action || "").toLowerCase();
+      // action: terminate | disable | restore | enable | delete
+      if (action === "delete") {
+        delete db.merchants[found.phone];
+        // hide products of this shop
+        db.products = (db.products || []).filter((x) => String(x.shop_id) !== String(found.merchant.shop_id));
+        saveDb(db);
+        console.log("[ADMIN] deleted merchant", found.phone, found.merchant.shop_id);
+        return json(res, 200, { ok: true, deleted: true, phone: found.phone });
+      }
+      const disable = action === "terminate" || action === "disable" || body.disabled === true;
+      const enable = action === "restore" || action === "enable" || body.disabled === false;
+      if (disable) {
+        found.merchant.disabled = true;
+        found.merchant.terminated = true;
+        found.merchant.terminated_at = Date.now();
+      } else if (enable) {
+        found.merchant.disabled = false;
+        found.merchant.terminated = false;
+        found.merchant.restored_at = Date.now();
+      } else {
+        return json(res, 400, { ok: false, error: "action terminate|restore|delete required" });
+      }
+      saveDb(db);
+      console.log("[ADMIN] merchant", found.phone, "disabled=", !!found.merchant.disabled);
+      return json(res, 200, {
+        ok: true,
+        phone: found.phone,
+        shop_id: found.merchant.shop_id,
+        disabled: isMerchantDisabled(found.merchant),
+      });
+    }
+
+
+    if (req.method === "GET" && p === "/admin/orders") {
+      const list = (db.orders || []).map((o) => ({
+        order_id: o.order_id,
+        shop_id: o.shop_id || "",
+        shop_name: o.shop_name || "",
+        customer_name: o.customer_name || "",
+        customer_phone: o.customer_phone || "",
+        total: o.total,
+        subtotal: o.subtotal,
+        delivery_fee: o.delivery_fee,
+        status: o.status_step != null ? o.status_step : o.status,
+        status_label: o.status_label || "",
+        placed_at: o.placed_at,
+        item_count: Array.isArray(o.items) ? o.items.length : 0,
+      }));
+      return json(res, 200, { ok: true, count: list.length, orders: list });
+    }
+
     if (req.method === "GET" && p === "/admin/stats") {
       return json(res, 200, {
         ok: true,
