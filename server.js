@@ -733,13 +733,32 @@ const server = http.createServer(async (req, res) => {
       if (!m || m.pin !== pin) {
         return json(res, 401, { ok: false, error: "Invalid phone or PIN" });
       }
+      if (isMerchantDisabled(m)) {
+        return json(res, 403, { ok: false, error: "This shop has been blocked by XOFROW Admin" });
+      }
       return json(res, 200, {
         ok: true,
         shop_id: m.shop_id,
         shop_name: m.shop_name,
         category: m.category || "",
         location: m.location || "",
+        logo_uri: getShopMeta(db, m.shop_id).logo_uri || "",
+        banner_uri: getShopMeta(db, m.shop_id).banner_uri || "",
       });
+    }
+
+    // Read shop profile (name/category/location/logo/banner)
+    if (req.method === "GET" && p === "/merchant/shop") {
+      const u = new URL(req.url, "http://localhost");
+      const shop_id = String(u.searchParams.get("shop_id") || "").trim();
+      if (!shop_id) return json(res, 400, { ok: false, error: "shop_id required" });
+      let found = null;
+      for (const phone of Object.keys(db.merchants)) {
+        if (db.merchants[phone].shop_id === shop_id) { found = db.merchants[phone]; break; }
+      }
+      if (!found) return json(res, 404, { ok: false, error: "Shop not found" });
+      const meta = getShopMeta(db, shop_id);
+      return json(res, 200, { ok:true, shop_id, shop_name:found.shop_name || "", category:found.category || "", location:found.location || "", logo_uri:meta.logo_uri || "", banner_uri:meta.banner_uri || "" });
     }
 
     // Update shop profile (name/category/location/logo/banner)
@@ -1181,23 +1200,32 @@ const server = http.createServer(async (req, res) => {
         return json(res, 403, { ok: false, error: "Invalid admin secret" });
       }
       const orders = db.orders || [];
-      let gmv = 0, deliveryFees = 0, delivered = 0, active = 0, rejected = 0;
+      let gmv = 0, deliveredGmv = 0, deliveryFees = 0, deliveredDeliveryFees = 0;
+      let delivered = 0, active = 0, rejected = 0;
       for (const o of orders) {
         const tot = Number(o.total) || 0;
+        const fee = Number(o.delivery_fee) || 0;
         gmv += tot;
-        deliveryFees += Number(o.delivery_fee) || 0;
+        deliveryFees += fee;
         const st = Number(o.status_step != null ? o.status_step : o.status);
-        if (st === 4) delivered++;
-        else if (st === 5 || st === 6) rejected++;
+        if (st === 4) {
+          delivered++;
+          deliveredGmv += tot;
+          deliveredDeliveryFees += fee;
+        } else if (st === 5 || st === 6) rejected++;
         else active++;
       }
-      const commission = Math.round(gmv * COMMISSION_RATE * 100) / 100;
+      // Earnings are realized only after delivery is confirmed.
+      const deliveredCommission = Math.round(deliveredGmv * COMMISSION_RATE * 100) / 100;
       return json(res, 200, {
         ok: true,
         gmv: Math.round(gmv * 100) / 100,
+        delivered_gmv: Math.round(deliveredGmv * 100) / 100,
         delivery_fees: Math.round(deliveryFees * 100) / 100,
+        delivered_delivery_fees: Math.round(deliveredDeliveryFees * 100) / 100,
         commission_rate: COMMISSION_RATE,
-        estimated_commission: commission,
+        estimated_commission: deliveredCommission,
+        xofrow_earnings: deliveredCommission,
         order_count: orders.length,
         delivered,
         active,
@@ -1283,6 +1311,80 @@ const server = http.createServer(async (req, res) => {
         phone: found.phone,
         shop_id: found.merchant.shop_id,
         disabled: isMerchantDisabled(found.merchant),
+      });
+    }
+
+
+    // Admin growth analytics. Revenue/growth is based only on delivered orders.
+    if (req.method === "GET" && p === "/admin/growth") {
+      if (!checkAdminSecret(req, { admin_secret: u.searchParams.get("admin_secret") })) {
+        return json(res, 403, { ok: false, error: "Invalid admin secret" });
+      }
+      const now = Date.now();
+      const DAY = 24 * 60 * 60 * 1000;
+      const orders = db.orders || [];
+      const buckets = [];
+      for (let i = 6; i >= 0; i--) {
+        const start = new Date(now - i * DAY);
+        start.setHours(0, 0, 0, 0);
+        const end = new Date(start.getTime() + DAY);
+        buckets.push({
+          date: start.toISOString().slice(0, 10),
+          label: start.toLocaleDateString("en-IN", { day: "2-digit", month: "short" }),
+          revenue: 0,
+          orders: 0,
+          earnings: 0
+        });
+        buckets[buckets.length - 1]._start = start.getTime();
+        buckets[buckets.length - 1]._end = end.getTime();
+      }
+      let last24Revenue = 0, previous24Revenue = 0, last24Orders = 0, previous24Orders = 0;
+      const deliveredRows = [];
+      for (const o of orders) {
+        const st = Number(o.status_step != null ? o.status_step : o.status);
+        if (st !== 4) continue;
+        const when = Number(o.delivered_at || o.placed_at || 0);
+        if (!when) continue;
+        const revenue = Number(o.total) || 0;
+        const earnings = revenue * COMMISSION_RATE;
+        deliveredRows.push({ when, revenue, earnings });
+        const age = now - when;
+        if (age >= 0 && age < DAY) {
+          last24Revenue += revenue;
+          last24Orders++;
+        } else if (age >= DAY && age < 2 * DAY) {
+          previous24Revenue += revenue;
+          previous24Orders++;
+        }
+        for (const b of buckets) {
+          if (when >= b._start && when < b._end) {
+            b.revenue += revenue;
+            b.orders++;
+            b.earnings += earnings;
+            break;
+          }
+        }
+      }
+      for (const b of buckets) {
+        delete b._start; delete b._end;
+        b.revenue = Math.round(b.revenue * 100) / 100;
+        b.earnings = Math.round(b.earnings * 100) / 100;
+      }
+      const growth = previous24Revenue === 0
+        ? (last24Revenue > 0 ? 100 : 0)
+        : ((last24Revenue - previous24Revenue) / previous24Revenue) * 100;
+      return json(res, 200, {
+        ok: true,
+        generated_at: now,
+        update_interval_hours: 24,
+        basis: "delivered_orders",
+        growth_percent: Math.round(growth * 10) / 10,
+        last_24h_revenue: Math.round(last24Revenue * 100) / 100,
+        previous_24h_revenue: Math.round(previous24Revenue * 100) / 100,
+        last_24h_orders: last24Orders,
+        previous_24h_orders: previous24Orders,
+        commission_rate: COMMISSION_RATE,
+        last_7_days: buckets
       });
     }
 
