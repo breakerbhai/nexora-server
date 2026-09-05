@@ -26,7 +26,9 @@ function checkAdminSecret(req, body) {
 }
 
 const DELIVERY_FEE = Math.max(0, Number(process.env.DELIVERY_FEE || 35));
-const FREE_DELIVERY_ABOVE = Math.max(0, Number(process.env.FREE_DELIVERY_ABOVE || 499));
+const FREE_DELIVERY_ABOVE = Math.max(0, Number(process.env.FREE_DELIVERY_ABOVE || 0));
+const XOFROW_BASE_LAT = Number(process.env.XOFROW_BASE_LAT || 0);
+const XOFROW_BASE_LNG = Number(process.env.XOFROW_BASE_LNG || 0);
 const DATA_DIR = path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const DB_TMP = path.join(DATA_DIR, "db.json.tmp");
@@ -74,6 +76,11 @@ function isMerchantDisabled(m) {
   return m.disabled === true || m.terminated === true || m.active === false;
 }
 
+function isPlatformEnabled(db, role) {
+  ensurePlatform(db);
+  return db.platform[role] !== false;
+}
+
 function findMerchantByShopId(db, shopId) {
   if (!shopId) return null;
   for (const phone of Object.keys(db.merchants || {})) {
@@ -84,6 +91,9 @@ function findMerchantByShopId(db, shopId) {
 }
 
 function ensurePlatform(db) {
+  if (!db.offers || typeof db.offers !== "object") db.offers = defaultOffers();
+  const offerDefaults = defaultOffers();
+  for (const k of Object.keys(offerDefaults)) if (db.offers[k] === undefined) db.offers[k] = offerDefaults[k];
   if (!db.platform || typeof db.platform !== "object") {
     db.platform = { customer: true, merchant: true, delivery: true };
   }
@@ -95,6 +105,9 @@ function ensurePlatform(db) {
 
 function ensureFcmStore(db) {
   if (!db.fcm_tokens || typeof db.fcm_tokens !== "object") db.fcm_tokens = {};
+  if (!db.offers || typeof db.offers !== "object") db.offers = defaultOffers();
+  const offerDefaults = defaultOffers();
+  for (const k of Object.keys(offerDefaults)) if (db.offers[k] === undefined) db.offers[k] = offerDefaults[k];
   if (!db.platform || typeof db.platform !== "object") {
     db.platform = { customer: true, merchant: true, delivery: true };
   }
@@ -339,6 +352,50 @@ function randomKey() {
 }
 
 
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function deliveryQuote(subtotal, lat, lng) {
+  let fee = 35;
+  let distance_km = null;
+  if (XOFROW_BASE_LAT && XOFROW_BASE_LNG && Number(lat) !== 0 && Number(lng) !== 0) {
+    distance_km = haversineKm(XOFROW_BASE_LAT, XOFROW_BASE_LNG, Number(lat), Number(lng));
+    if (distance_km <= 2) fee = 25;
+    else if (distance_km <= 5) fee = 30;
+    else if (distance_km <= 8) fee = 40;
+    else fee = 40;
+  } else {
+    fee = DELIVERY_FEE;
+  }
+  const free = FREE_DELIVERY_ABOVE > 0 && subtotal >= FREE_DELIVERY_ABOVE;
+  return { fee: free ? 0 : fee, distance_km, free_delivery: free };
+}
+
+function defaultOffers() {
+  return {
+    first_order_enabled: true,
+    first_order_discount_percent: 10,
+    first_order_max_order: 1500,
+    first_order_code: "FIRST10",
+    first_order_campaign_limit: 1000,
+    first_order_title: "First order: 10% OFF",
+    campaign_title: "XOFROW Offers",
+    campaign_subtitle: "Your first order gets 10% OFF",
+    campaign_image_uri: "",
+    challenge_enabled: true,
+    challenge_text: "Complete 10 orders and unlock a special ₹1 reward",
+    challenge_reward_text: "500ml cooking oil for ₹1",
+    updated_at: Date.now()
+  };
+}
+
 function emptyDb() {
   return {
     api_key: DEFAULT_API_KEY,
@@ -349,6 +406,7 @@ function emptyDb() {
     shop_meta: {},
     fcm_tokens: {},
     platform: { customer: true, merchant: true, delivery: true },
+    offers: defaultOffers(),
   };
 }
 
@@ -361,6 +419,9 @@ function normalizeDb(db) {
   if (!Array.isArray(db.products)) db.products = [];
   if (!db.shop_meta) db.shop_meta = {};
   if (!db.fcm_tokens || typeof db.fcm_tokens !== "object") db.fcm_tokens = {};
+  if (!db.offers || typeof db.offers !== "object") db.offers = defaultOffers();
+  const offerDefaults = defaultOffers();
+  for (const k of Object.keys(offerDefaults)) if (db.offers[k] === undefined) db.offers[k] = offerDefaults[k];
   if (!db.platform || typeof db.platform !== "object") {
     db.platform = { customer: true, merchant: true, delivery: true };
   }
@@ -540,10 +601,16 @@ const server = http.createServer(async (req, res) => {
     
     // ----- FCM device token register (Hybrid push) -----
     if (req.method === "GET" && p === "/config/fees") {
+      const lat = Number(u.searchParams.get("lat") || 0);
+      const lng = Number(u.searchParams.get("lng") || 0);
+      const subtotal = Number(u.searchParams.get("subtotal") || 0);
+      const quote = deliveryQuote(subtotal, lat, lng);
       return json(res, 200, {
         ok: true,
-        delivery_fee: DELIVERY_FEE,
+        delivery_fee: quote.fee,
+        distance_km: quote.distance_km,
         free_delivery_above: FREE_DELIVERY_ABOVE,
+        distance_pricing: [{max_km:2,fee:25},{max_km:5,fee:30},{max_km:8,fee:40}],
         currency: "INR",
       });
     }
@@ -565,6 +632,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && p === "/send-otp") {
       const body = await readBody(req);
+      const role = String(body.role || "customer").toLowerCase();
+      if (!["customer", "merchant"].includes(role)) {
+        return json(res, 400, { ok: false, error: "Invalid OTP role" });
+      }
+      if (!isPlatformEnabled(db, role)) {
+        return json(res, 503, { ok: false, error: role === "merchant" ? "Merchant app is currently disabled by XOFROW Admin" : "Customer app is currently disabled by XOFROW Admin" });
+      }
       let phone = String(body.phone || "").trim().replace(/\D/g, "");
       if (phone.length > 10) phone = phone.slice(-10);
       if (phone.length < 10) return json(res, 400, { ok: false, error: "Valid phone required" });
@@ -597,6 +671,7 @@ const server = http.createServer(async (req, res) => {
         if (result.ok && result.verificationId) {
           db.otps[phone] = {
             provider: "messagecentral",
+            role,
             verificationId: result.verificationId,
             expires: Date.now() + 5 * 60 * 1000,
           };
@@ -610,7 +685,7 @@ const server = http.createServer(async (req, res) => {
         }
         console.log(`[OTP] MC FAIL ${phone}:`, result.error || result.body);
         // Keep OTP in DB; return otp_dev so survey/demo register still works if SMS fails
-        db.otps[phone] = { code: genOtp(), expires: Date.now() + 5 * 60 * 1000, provider: "local_fallback" };
+        db.otps[phone] = { code: genOtp(), role, expires: Date.now() + 5 * 60 * 1000, provider: "local_fallback" };
         // reuse code already generated above if present in closure — regenerate linked below
         const resp = {
           ok: true,
@@ -670,6 +745,9 @@ const server = http.createServer(async (req, res) => {
       const otp = String(body.otp || "").trim();
       const rec = db.otps[phone];
       if (!rec) return json(res, 400, { ok: false, error: "No OTP requested for this phone" });
+      if (rec.role && !isPlatformEnabled(db, rec.role)) {
+        return json(res, 503, { ok: false, error: rec.role === "merchant" ? "Merchant app is currently disabled by XOFROW Admin" : "Customer app is currently disabled by XOFROW Admin" });
+      }
       if (Date.now() > rec.expires) {
         delete db.otps[phone];
         saveDb(db);
@@ -698,6 +776,7 @@ const server = http.createServer(async (req, res) => {
 
     // ----- Merchant register / login -----
     if (req.method === "POST" && p === "/merchant/register") {
+      if (!isPlatformEnabled(db, "merchant")) return json(res, 503, { ok: false, error: "Merchant app is currently disabled by XOFROW Admin" });
       const body = await readBody(req);
       const phone = String(body.phone || "").trim();
       const pin = String(body.pin || "").trim();
@@ -775,6 +854,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       if (!found) return json(res, 404, { ok: false, error: "Shop not found" });
+      if (isMerchantDisabled(found)) return json(res, 403, { ok: false, error: "This shop is blocked by XOFROW Admin" });
 
       if (body.shop_name != null) found.shop_name = String(body.shop_name).trim();
       if (body.category != null) found.category = String(body.category).trim();
@@ -798,6 +878,7 @@ const server = http.createServer(async (req, res) => {
 
     // ----- Orders -----
     if (req.method === "POST" && p === "/orders") {
+      if (!isPlatformEnabled(db, "customer")) return json(res, 503, { ok: false, error: "Customer ordering is currently disabled by XOFROW Admin" });
       const body = await readBody(req);
       const _customerName = String(body.customer_name || "").trim();
       const _customerPhone = String(body.customer_phone || "").trim();
@@ -830,9 +911,28 @@ const server = http.createServer(async (req, res) => {
         status_step: 0,
         subtotal: 0,
         delivery_fee: 0,
-        discount: Number(body.discount) || 0,
+        // No coupon engine exists yet; never trust a client-supplied discount.
+        discount: 0,
+        coupon_code: String(body.coupon_code || "").trim().toUpperCase(),
         mrp_total: Number(body.mrp_total) || 0,
       };
+      // Server-authoritative first-order coupon. A new verified phone gets the
+      // first-order benefit regardless of referral/source. The ₹1,500 ceiling is
+      // an eligibility ceiling, not a discount cap: orders above it are rejected.
+      if (order.coupon_code) {
+        const offers = db.offers || defaultOffers();
+        const prior = (db.orders || []).some(x => String(x.customer_phone || "").replace(/\D/g, "") === String(order.customer_phone || "").replace(/\D/g, ""));
+        if (!offers.first_order_enabled || order.coupon_code !== String(offers.first_order_code || "FIRST10").toUpperCase()) {
+          return json(res, 400, { ok:false, error:"Coupon is not valid" });
+        }
+        if (prior) return json(res, 400, { ok:false, error:"First-order coupon is only for new customers" });
+        const used = (db.orders || []).filter(x => String(x.coupon_code || "").toUpperCase() === String(offers.first_order_code || "FIRST10").toUpperCase()).length;
+        if (used >= Number(offers.first_order_campaign_limit || 1000)) return json(res, 400, { ok:false, error:"This first-order campaign has ended" });
+        if (Number(body.subtotal || 0) > Number(offers.first_order_max_order || 1500)) {
+          return json(res, 400, { ok:false, error:"First-order coupon is valid only up to ₹" + Number(offers.first_order_max_order || 1500) });
+        }
+        order.discount = Math.round(order.subtotal * (Number(offers.first_order_discount_percent || 10) / 100) * 100) / 100;
+      }
       // Server-side fee (do not trust client-only total long-term)
       {
         let sub = 0;
@@ -843,9 +943,10 @@ const server = http.createServer(async (req, res) => {
         }
         if (!sub) sub = Number(body.subtotal || body.total) || 0;
         order.subtotal = Math.round(sub * 100) / 100;
-        const fee = order.subtotal >= FREE_DELIVERY_ABOVE ? 0 : DELIVERY_FEE;
-        order.delivery_fee = fee;
-        order.total = Math.round((order.subtotal + fee - (order.discount || 0)) * 100) / 100;
+        const quote = deliveryQuote(order.subtotal, order.lat, order.lng);
+        order.delivery_fee = quote.fee;
+        order.distance_km = quote.distance_km;
+        order.total = Math.round((order.subtotal + order.delivery_fee - (order.discount || 0)) * 100) / 100;
         if (order.total < 0) order.total = 0;
       }
       if (!order.full_address) {
@@ -860,6 +961,52 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
+      if (!order.shop_id) return json(res, 400, { ok: false, error: "Shop is required" });
+      const shopOwner = findMerchantByShopId(db, order.shop_id);
+      if (!shopOwner || isMerchantDisabled(shopOwner.merchant)) {
+        return json(res, 409, { ok: false, error: "This shop is currently unavailable" });
+      }
+      // Re-check current catalog prices/sold-out state when product IDs are present.
+      // This prevents stale client prices from becoming the final order amount.
+      if (order.items.length) {
+        let catalogSubtotal = 0;
+        for (const it of order.items) {
+          const pid = String(it.product_id || it.id || "");
+          const qty = Math.max(1, Number(it.quantity || it.qty || 1));
+          if (!pid) {
+            catalogSubtotal += Number(it.price || 0) * qty;
+            continue;
+          }
+          const pr = db.products.find(x => String(x.id) === pid && String(x.shop_id) === String(order.shop_id));
+          if (!pr) return json(res, 409, { ok: false, error: "One or more products are no longer available" });
+          if (pr.sold_out === true) return json(res, 409, { ok: false, error: `Product sold out: ${pr.name || pid}` });
+          const currentPrice = Number(pr.price) || 0;
+          catalogSubtotal += currentPrice * qty;
+          it.price = currentPrice;
+          it.name = pr.name || it.name || "Item";
+        }
+        order.subtotal = Math.round(catalogSubtotal * 100) / 100;
+        const quote = deliveryQuote(order.subtotal, order.lat, order.lng);
+        order.delivery_fee = quote.fee;
+        order.distance_km = quote.distance_km;
+        order.total = Math.max(0, Math.round((order.subtotal + order.delivery_fee - (order.discount || 0)) * 100) / 100);
+      }
+      if (order.coupon_code) {
+        const offers = db.offers || defaultOffers();
+        if (order.subtotal > Number(offers.first_order_max_order || 1500)) {
+          return json(res, 400, { ok:false, error:"First-order coupon is valid only up to ₹" + Number(offers.first_order_max_order || 1500) });
+        }
+        order.discount = Math.round(order.subtotal * (Number(offers.first_order_discount_percent || 10) / 100) * 100) / 100;
+        const quote = deliveryQuote(order.subtotal, order.lat, order.lng);
+        order.delivery_fee = quote.fee;
+        order.distance_km = quote.distance_km;
+        order.total = Math.max(0, Math.round((order.subtotal + order.delivery_fee - order.discount) * 100) / 100);
+      }
+
+      const duplicate = db.orders.find(x => String(x.order_id) === String(order.order_id));
+      if (duplicate) {
+        return json(res, 200, { ok: true, order_id: duplicate.order_id, duplicate: true, status: duplicate.status });
+      }
       db.orders.unshift(order);
       saveDb(db);
       console.log(`[ORDER] ${order.order_id} ${order.customer_name} ₹${order.total}`);
@@ -872,6 +1019,8 @@ const server = http.createServer(async (req, res) => {
       const shopId = u.searchParams.get("shop_id");
       const phone = String(u.searchParams.get("customer_phone") || u.searchParams.get("phone") || "").replace(/\D/g, "");
       if (shopId) {
+        const owner = findMerchantByShopId(db, shopId);
+        if (owner && isMerchantDisabled(owner.merchant)) return json(res, 403, { ok: false, error: "This shop is blocked by XOFROW Admin" });
         list = list.filter(
           (o) => o.shop_id === shopId || (!o.shop_id && matchShopName(db, shopId, o.shop_name))
         );
@@ -925,12 +1074,28 @@ const server = http.createServer(async (req, res) => {
       const status = Number(body.status);
       const o = db.orders.find((x) => x.order_id === orderId);
       if (!o) return json(res, 404, { ok: false, error: "Order not found" });
+      const actor = String(body.actor || "merchant").toLowerCase();
+      if (!["merchant", "customer"].includes(actor)) return json(res, 400, { ok: false, error: "Invalid status actor" });
+      if (actor === "customer") {
+        if (status !== 6) return json(res, 403, { ok: false, error: "Customer can only cancel an order" });
+        const phone = String(body.customer_phone || "").replace(/\D/g, "");
+        const orderPhone = String(o.customer_phone || "").replace(/\D/g, "");
+        if (!phone || !orderPhone || phone.slice(-10) !== orderPhone.slice(-10)) return json(res, 403, { ok: false, error: "Order does not belong to this customer" });
+      } else {
+        const shopId = String(body.shop_id || "");
+        const owner = findMerchantByShopId(db, shopId);
+        if (!owner || String(o.shop_id) !== shopId) return json(res, 403, { ok: false, error: "Order does not belong to this shop" });
+        if (isMerchantDisabled(owner.merchant)) return json(res, 403, { ok: false, error: "This shop is blocked by XOFROW Admin" });
+      }
 
       // Status map (must match merchant app):
       // 0 Pending, 1 Confirmed, 2 Packed, 3 Out for delivery, 4 Delivered, 5 Rejected
 
       // Out for delivery → OTP + QR token for delivery boy app
       if (status === 3) {
+        if (actor === "merchant" && Number(o.status || o.status_step || 0) !== 2) {
+          return json(res, 400, { ok: false, error: "Pack the order before sending it for delivery" });
+        }
         if (!o.delivery_otp) {
           o.delivery_otp = String(Math.floor(1000 + Math.random() * 9000));
         }
@@ -954,6 +1119,17 @@ const server = http.createServer(async (req, res) => {
 
       const currentStatus = Number(o.status || o.status_step || 0);
 
+      // Merchant status progression must be forward-only. Delivery confirmation
+      // is handled by /delivery/complete after customer OTP verification.
+      if (actor === "merchant") {
+        if (status === 1 && currentStatus !== 0) return json(res, 400, { ok: false, error: "Order can be confirmed only while pending" });
+        if (status === 2 && currentStatus !== 1) return json(res, 400, { ok: false, error: "Confirm the order before marking it packed" });
+        if (status === 3 && currentStatus !== 2) return json(res, 400, { ok: false, error: "Pack the order before sending it for delivery" });
+        if (status === 4) return json(res, 400, { ok: false, error: "Delivery app must confirm delivery with customer OTP" });
+        if (status === 5 && currentStatus > 2) return json(res, 400, { ok: false, error: "Cannot reject after the order is out for delivery" });
+        if (![1,2,3,5].includes(status)) return json(res, 400, { ok: false, error: "Invalid merchant status" });
+      }
+
       // Prevent invalid transitions
       if (status === 4 && currentStatus < 3) {
         return json(res, 400, { ok: false, error: "Cannot mark as delivered before out-for-delivery" });
@@ -966,8 +1142,8 @@ const server = http.createServer(async (req, res) => {
       // Mark Delivered (merchant-side) → require OTP if issued
       if (status === 4) {
         const got = String(body.otp || body.delivery_otp || "").trim();
-        if (o.delivery_otp && got && got !== String(o.delivery_otp)) {
-          return json(res, 400, { ok: false, error: "Invalid delivery OTP", need_otp: true });
+        if (o.delivery_otp && got !== String(o.delivery_otp)) {
+          return json(res, 400, { ok: false, error: "Valid delivery OTP is required", need_otp: true });
         }
         o.status = 4;
         o.status_step = 4;
@@ -1013,8 +1189,32 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, order_id: orderId, status, delivery_otp: o.delivery_otp || null });
     }
 
+    // Customer rating — server-backed aggregate, one rating per order.
+    if (req.method === "POST" && p === "/ratings") {
+      const body = await readBody(req);
+      const orderId = String(body.order_id || "").trim();
+      const phone = String(body.customer_phone || "").replace(/\D/g, "");
+      const stars = Math.max(1, Math.min(5, Number(body.stars) || 0));
+      const order = (db.orders || []).find(o => String(o.order_id) === orderId);
+      if (!order || String(order.customer_phone || "").replace(/\D/g, "") !== phone) return json(res, 403, {ok:false,error:"Rating not allowed for this order"});
+      if (Number(order.status_step != null ? order.status_step : order.status) !== 4) return json(res, 400, {ok:false,error:"You can rate only after delivery"});
+      if (!order.shop_id) return json(res, 400, {ok:false,error:"Shop missing"});
+      const meta = getShopMeta(db, order.shop_id);
+      if (!Array.isArray(meta.ratings)) meta.ratings = [];
+      if (meta.ratings.some(r => String(r.order_id) === orderId)) return json(res, 409, {ok:false,error:"Already rated"});
+      meta.ratings.push({order_id:orderId,stars,comment:String(body.comment||""),phone,created_at:Date.now()});
+      meta.rating_count = meta.ratings.length;
+      meta.rating = Math.round(meta.ratings.reduce((a,r)=>a+Number(r.stars||0),0)/meta.ratings.length*10)/10;
+      db.shop_meta[order.shop_id] = meta;
+      saveDb(db);
+      return json(res, 200, {ok:true,rating:meta.rating,rating_count:meta.rating_count});
+    }
+
     // ----- Shops (from merchants + meta; also recover shop_ids seen on products) -----
     if (req.method === "GET" && p === "/shops") {
+      if (String(u.searchParams.get("role") || "").toLowerCase() === "customer" && !isPlatformEnabled(db, "customer")) {
+        return json(res, 503, { ok: false, error: "Customer service is currently disabled by XOFROW Admin" });
+      }
       const byId = {};
       for (const phone of Object.keys(db.merchants)) {
         const m = db.merchants[phone];
@@ -1050,9 +1250,16 @@ const server = http.createServer(async (req, res) => {
 
     // ----- Products -----
     if (req.method === "GET" && p === "/products") {
+      if (String(u.searchParams.get("role") || "").toLowerCase() === "customer" && !isPlatformEnabled(db, "customer")) {
+        return json(res, 503, { ok: false, error: "Customer service is currently disabled by XOFROW Admin" });
+      }
       let list = db.products.slice();
       const shopId = u.searchParams.get("shop_id");
-      if (shopId) list = list.filter((pr) => pr.shop_id === shopId);
+      if (shopId) {
+        list = list.filter((pr) => pr.shop_id === shopId);
+        const owner = findMerchantByShopId(db, shopId);
+        if (owner && isMerchantDisabled(owner.merchant)) return json(res, 403, { ok: false, error: "This shop is blocked by XOFROW Admin" });
+      }
       return json(res, 200, { ok: true, products: list });
     }
 
@@ -1067,6 +1274,8 @@ const server = http.createServer(async (req, res) => {
       const shop_id = String(body.shop_id || "").trim();
       const name = String(body.name || "").trim();
       const price = Number(body.price) || 0;
+      const mrpRaw = Number(body.mrp);
+      const mrp = mrpRaw > 0 ? Math.max(mrpRaw, price) : price;
       const description = String(body.description || "");
       const image_uri = body.image_uri || body.image_url || "";
       const sold_out = !!body.sold_out;
@@ -1079,33 +1288,16 @@ const server = http.createServer(async (req, res) => {
       if (!name) return json(res, 400, { ok: false, error: "Product name required" });
       if (!shop_id) return json(res, 400, { ok: false, error: "shop_id required" });
 
-      // Keep a merchant/shop row alive so customer /shops does not go empty after restarts
-      let hasMerchant = false;
-      for (const phone of Object.keys(db.merchants)) {
-        if (db.merchants[phone].shop_id === shop_id) {
-          hasMerchant = true;
-          break;
-        }
-      }
-      if (!hasMerchant) {
-        const stubPhone = "shopstub_" + shop_id;
-        db.merchants[stubPhone] = {
-          pin: "",
-          shop_id,
-          shop_name: String(body.shop_name || "Shop").trim() || "Shop",
-          category: String(body.category || "General").trim() || "General",
-          location: String(body.location || "").trim(),
-          created_at: Date.now(),
-          stub: true,
-        };
-        getShopMeta(db, shop_id);
-      }
+      const owner = findMerchantByShopId(db, shop_id);
+      if (!owner) return json(res, 404, { ok: false, error: "Shop not found" });
+      if (isMerchantDisabled(owner.merchant)) return json(res, 403, { ok: false, error: "This shop is blocked by XOFROW Admin" });
 
       const prod = {
         id,
         shop_id,
         name,
         price,
+        mrp,
         description,
         image_uri: image_uris[0] || image_uri || "",
         image_uris,
@@ -1135,6 +1327,9 @@ const server = http.createServer(async (req, res) => {
         id = String(body.id || "");
         shop_id = String(body.shop_id || "");
       }
+      const owner = findMerchantByShopId(db, shop_id);
+      if (!owner) return json(res, 404, { ok: false, error: "Shop not found" });
+      if (isMerchantDisabled(owner.merchant)) return json(res, 403, { ok: false, error: "This shop is blocked by XOFROW Admin" });
       const before = db.products.length;
       db.products = db.products.filter((pr) => {
         if (pr.id !== id) return true;
@@ -1163,6 +1358,34 @@ const server = http.createServer(async (req, res) => {
 
     // Debug snapshot (authenticated)
     
+    // Customer offer configuration — editable by Admin without an app update.
+    if (req.method === "GET" && p === "/config/offers") {
+      if (String(u.searchParams.get("role") || "").toLowerCase() === "customer" && !isPlatformEnabled(db, "customer")) {
+        return json(res, 503, { ok: false, error: "Customer service is currently disabled by XOFROW Admin" });
+      }
+      return json(res, 200, { ok: true, offers: db.offers || defaultOffers() });
+    }
+
+    // Admin offer editor, including campaign image as a data URI.
+    if (req.method === "POST" && p === "/admin/offers") {
+      const body = await readBody(req);
+      if (!checkAdminSecret(req, body)) return json(res, 403, { ok:false, error:"Invalid admin secret" });
+      const current = db.offers || defaultOffers();
+      const allowed = [
+        "first_order_enabled","first_order_discount_percent","first_order_max_order","first_order_code","first_order_campaign_limit",
+        "first_order_title","campaign_title","campaign_subtitle","campaign_image_uri",
+        "challenge_enabled","challenge_text","challenge_reward_text"
+      ];
+      for (const key of allowed) if (body[key] !== undefined) current[key] = body[key];
+      current.first_order_discount_percent = Math.max(0, Math.min(100, Number(current.first_order_discount_percent) || 10));
+      current.first_order_max_order = Math.max(1, Number(current.first_order_max_order) || 1500);
+      current.first_order_campaign_limit = Math.max(1, Number(current.first_order_campaign_limit) || 1000);
+      current.updated_at = Date.now();
+      db.offers = current;
+      saveDb(db);
+      return json(res, 200, { ok:true, offers: current });
+    }
+
     // ----- Platform kill-switch (apps check this on open) -----
     if (req.method === "GET" && p === "/platform/status") {
       ensurePlatform(db);
@@ -1390,6 +1613,9 @@ const server = http.createServer(async (req, res) => {
 
 
     if (req.method === "GET" && p === "/admin/orders") {
+      if (!checkAdminSecret(req, { admin_secret: u.searchParams.get("admin_secret") })) {
+        return json(res, 403, { ok: false, error: "Invalid admin secret" });
+      }
       const list = (db.orders || []).map((o) => ({
         order_id: o.order_id,
         shop_id: o.shop_id || "",
@@ -1420,6 +1646,7 @@ const server = http.createServer(async (req, res) => {
 
     // ----- Delivery boy: scan QR / enter token → customer contact + address -----
     if (req.method === "GET" && p === "/delivery/lookup") {
+      if (!isPlatformEnabled(db, "delivery")) return json(res, 503, { ok: false, error: "Delivery service is currently disabled by XOFROW Admin" });
       let code = String(u.searchParams.get("code") || u.searchParams.get("token") || "").trim().toUpperCase();
       // Accept payload form NEXORA|TOKEN or bare token
       if (code.includes("|")) code = code.split("|").pop().trim();
@@ -1462,6 +1689,7 @@ const server = http.createServer(async (req, res) => {
 
     // Delivery boy at door: send OTP SMS to customer (MessageCentral)
     if (req.method === "POST" && p === "/delivery/send-otp") {
+      if (!isPlatformEnabled(db, "delivery")) return json(res, 503, { ok: false, error: "Delivery service is currently disabled by XOFROW Admin" });
       const body = await readBody(req);
       let code = String(body.code || body.token || "").trim().toUpperCase();
       if (code.includes("|")) code = code.split("|").pop().trim();
@@ -1515,6 +1743,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && p === "/delivery/complete") {
+      if (!isPlatformEnabled(db, "delivery")) return json(res, 503, { ok: false, error: "Delivery service is currently disabled by XOFROW Admin" });
       const body = await readBody(req);
       let code = String(body.code || body.token || "").trim().toUpperCase();
       if (code.includes("|")) code = code.split("|").pop().trim();
