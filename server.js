@@ -19,6 +19,12 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 const ADMIN_SECRET = (process.env.ADMIN_SECRET || process.env.ADMIN_PIN || "258000").trim();
 const COMMISSION_RATE = Math.min(0.5, Math.max(0, Number(process.env.COMMISSION_RATE || 0.05)));
 
+// All admin endpoints must verify ADMIN_SECRET — an empty/missing secret must never pass.
+function checkAdminSecret(req, body) {
+  const secret = String((body && (body.admin_secret || body.secret)) || req.headers["x-admin-secret"] || "").trim();
+  return !!secret && secret === ADMIN_SECRET;
+}
+
 const DELIVERY_FEE = Math.max(0, Number(process.env.DELIVERY_FEE || 35));
 const FREE_DELIVERY_ABOVE = Math.max(0, Number(process.env.FREE_DELIVERY_ABOVE || 499));
 const DATA_DIR = path.join(__dirname, "data");
@@ -206,10 +212,11 @@ async function connectMongo() {
 const MC_CUSTOMER_ID = (process.env.MC_CUSTOMER_ID || "").trim();
 const MC_BASE64_KEY = (process.env.MC_BASE64_KEY || "").trim();
 const MC_SHOW_DEV_OTP =
-  process.env.MC_SHOW_DEV_OTP === "1" ||
-  process.env.MC_SHOW_DEV_OTP === "true" ||
-  process.env.SURVEY_MODE === "1" ||
-  process.env.SURVEY_MODE === "true";
+  (process.env.MC_SHOW_DEV_OTP === "1" ||
+    process.env.MC_SHOW_DEV_OTP === "true" ||
+    process.env.SURVEY_MODE === "1" ||
+    process.env.SURVEY_MODE === "true") &&
+  process.env.NODE_ENV !== "production";
 
 function mcEnabled() {
   return MC_CUSTOMER_ID.length > 2 && MC_BASE64_KEY.length > 5;
@@ -699,7 +706,7 @@ const server = http.createServer(async (req, res) => {
       const location = String(body.location || "").trim();
       if (phone.length < 10) return json(res, 400, { ok: false, error: "Valid phone required" });
       if (pin.length < 4) return json(res, 400, { ok: false, error: "PIN at least 4 digits" });
-      if (!shop_name) return json(res, 400, { ok: false, error: "Shop name required" });
+      if (!shop_name || shop_name.length < 2) return json(res, 400, { ok: false, error: "Shop name must be at least 2 characters" });
       if (db.merchants[phone]) {
         return json(res, 400, { ok: false, error: "This phone is already registered. Sign in instead." });
       }
@@ -773,6 +780,14 @@ const server = http.createServer(async (req, res) => {
     // ----- Orders -----
     if (req.method === "POST" && p === "/orders") {
       const body = await readBody(req);
+      const _customerName = String(body.customer_name || "").trim();
+      const _customerPhone = String(body.customer_phone || "").trim();
+      if (!_customerName || _customerName.length < 2) {
+        return json(res, 400, { ok: false, error: "Customer name required" });
+      }
+      if (!_customerPhone || _customerPhone.length < 10) {
+        return json(res, 400, { ok: false, error: "Valid customer phone required" });
+      }
       const order = {
         order_id: body.order_id || genId("NX"),
         shop_name: body.shop_name || "",
@@ -863,7 +878,7 @@ const server = http.createServer(async (req, res) => {
       if (Number(o.status) !== 4 && Number(o.status_step) !== 4) {
         return json(res, 400, { ok: false, error: "Only delivered orders can be returned" });
       }
-      const cat = String(body.shop_category || o.shop_category || o.category || "").toLowerCase();
+      const cat = String(o.shop_category || o.category || "").toLowerCase();
       const groceryHints = ["grocery", "kirana", "food", "fresh", "dairy", "vegetable", "fruit", "meat", "bakery"];
       if (groceryHints.some((g) => cat.includes(g))) {
         return json(res, 400, { ok: false, error: "Grocery / food orders are not eligible for return. Contact shop for damaged/wrong item refund." });
@@ -897,7 +912,9 @@ const server = http.createServer(async (req, res) => {
 
       // Out for delivery → OTP + QR token for delivery boy app
       if (status === 3) {
-        o.delivery_otp = String(Math.floor(1000 + Math.random() * 9000));
+        if (!o.delivery_otp) {
+          o.delivery_otp = String(Math.floor(1000 + Math.random() * 9000));
+        }
         o.delivery_token = o.delivery_token || ("NXD" + crypto.randomBytes(8).toString("hex").toUpperCase());
         o.status = 3;
         o.status_label = "Out for delivery";
@@ -914,6 +931,17 @@ const server = http.createServer(async (req, res) => {
           delivery_token: o.delivery_token,
           qr_payload: "NEXORA|" + o.delivery_token,
         });
+      }
+
+      const currentStatus = Number(o.status || o.status_step || 0);
+
+      // Prevent invalid transitions
+      if (status === 4 && currentStatus < 3) {
+        return json(res, 400, { ok: false, error: "Cannot mark as delivered before out-for-delivery" });
+      }
+
+      if (status === 5 && currentStatus > 3) {
+        return json(res, 400, { ok: false, error: "Cannot reject after out-for-delivery" });
       }
 
       // Mark Delivered (merchant-side) → require OTP if issued
@@ -1132,8 +1160,7 @@ const server = http.createServer(async (req, res) => {
     // Admin: enable/disable any app (requires ADMIN_SECRET)
     if (req.method === "POST" && p === "/admin/platform") {
       const body = await readBody(req);
-      const secret = String(body.admin_secret || body.secret || req.headers["x-admin-secret"] || "").trim();
-      if (!secret || secret !== ADMIN_SECRET) {
+      if (!checkAdminSecret(req, body)) {
         return json(res, 403, { ok: false, error: "Invalid admin secret" });
       }
       ensurePlatform(db);
@@ -1150,8 +1177,7 @@ const server = http.createServer(async (req, res) => {
 
     // Admin money overview
     if (req.method === "GET" && p === "/admin/money") {
-      const secret = String(u.searchParams.get("admin_secret") || req.headers["x-admin-secret"] || "").trim();
-      if (secret && secret !== ADMIN_SECRET) {
+      if (!checkAdminSecret(req, { admin_secret: u.searchParams.get("admin_secret") })) {
         return json(res, 403, { ok: false, error: "Invalid admin secret" });
       }
       const orders = db.orders || [];
@@ -1186,8 +1212,7 @@ const server = http.createServer(async (req, res) => {
     
     // List all merchants (admin)
     if (req.method === "GET" && p === "/admin/merchants") {
-      const secret = String(u.searchParams.get("admin_secret") || req.headers["x-admin-secret"] || "").trim();
-      if (secret && secret !== ADMIN_SECRET) {
+      if (!checkAdminSecret(req, { admin_secret: u.searchParams.get("admin_secret") })) {
         return json(res, 403, { ok: false, error: "Invalid admin secret" });
       }
       const list = [];
@@ -1211,8 +1236,7 @@ const server = http.createServer(async (req, res) => {
     // Terminate / restore one merchant shop
     if (req.method === "POST" && p === "/admin/merchant") {
       const body = await readBody(req);
-      const secret = String(body.admin_secret || body.secret || req.headers["x-admin-secret"] || "").trim();
-      if (!secret || secret !== ADMIN_SECRET) {
+      if (!checkAdminSecret(req, body)) {
         return json(res, 403, { ok: false, error: "Invalid admin secret" });
       }
       const shopId = String(body.shop_id || "").trim();
@@ -1227,11 +1251,16 @@ const server = http.createServer(async (req, res) => {
       const action = String(body.action || "").toLowerCase();
       // action: terminate | disable | restore | enable | delete
       if (action === "delete") {
+        const shopId = found.merchant.shop_id;
         delete db.merchants[found.phone];
         // hide products of this shop
-        db.products = (db.products || []).filter((x) => String(x.shop_id) !== String(found.merchant.shop_id));
+        db.products = (db.products || []).filter((x) => String(x.shop_id) !== String(shopId));
+        // cleanup orphaned shop_meta
+        if (shopId && db.shop_meta) {
+          delete db.shop_meta[shopId];
+        }
         saveDb(db);
-        console.log("[ADMIN] deleted merchant", found.phone, found.merchant.shop_id);
+        console.log("[ADMIN] deleted merchant", found.phone, shopId);
         return json(res, 200, { ok: true, deleted: true, phone: found.phone });
       }
       const disable = action === "terminate" || action === "disable" || body.disabled === true;
